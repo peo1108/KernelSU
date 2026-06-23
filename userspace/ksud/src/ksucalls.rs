@@ -1,5 +1,4 @@
 #![allow(clippy::unreadable_literal)]
-use anyhow::bail;
 
 use crate::ksu_uapi;
 use anyhow::{Context, Result, bail};
