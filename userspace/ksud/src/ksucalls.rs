@@ -252,6 +252,7 @@ fn read_c_string(src: &[c_char]) -> String {
         .iter()
         .copied()
         .take_while(|v| *v != 0)
+        .map(|v| v as u8)
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&bytes).to_string()
 }
