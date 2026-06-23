@@ -18,6 +18,7 @@
 #include "runtime/ksud.h"
 #include "runtime/ksud_boot.h"
 #include "feature/sulog.h"
+#include "feature/web_su_prompt.h"
 #include "supercall/supercall.h"
 #include "ksu.h"
 #include "infra/file_wrapper.h"
@@ -131,6 +132,7 @@ int __init kernelsu_init(void)
 
     ksu_feature_init();
     ksu_sulog_init();
+    ksu_web_su_prompt_init();
     ksu_adb_root_init();
     ksu_lsm_hook_init();
     ksu_selinux_hide_init();
@@ -209,6 +211,7 @@ void __exit kernelsu_exit(void)
     ksu_selinux_hide_exit();
     ksu_lsm_hook_exit();
     ksu_adb_root_exit();
+    ksu_web_su_prompt_exit();
     ksu_sulog_exit();
     ksu_feature_exit();
 

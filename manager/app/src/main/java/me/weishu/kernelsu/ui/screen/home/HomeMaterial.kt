@@ -193,10 +193,10 @@ private fun StatusCard(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         TonalCard(
-            containerColor = if (state.ksuVersion != null) {
-                MaterialTheme.colorScheme.secondaryContainer
-            } else {
-                MaterialTheme.colorScheme.errorContainer
+            containerColor = when {
+                state.ksuVersion != null && state.isManager -> MaterialTheme.colorScheme.secondaryContainer
+                state.showManagerUnauthorizedWarning -> MaterialTheme.colorScheme.tertiaryContainer
+                else -> MaterialTheme.colorScheme.errorContainer
             },
             onClick = {
                 if (!state.isLateLoadMode) {
@@ -211,6 +211,29 @@ private fun StatusCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 when {
+                    state.showManagerUnauthorizedWarning -> {
+                        Icon(
+                            Icons.Outlined.Warning,
+                            stringResource(R.string.home_manager_not_authorized)
+                        )
+                        Column(Modifier.padding(start = 20.dp)) {
+                            Text(
+                                text = stringResource(R.string.home_manager_not_authorized),
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = stringResource(R.string.home_manager_not_authorized_summary),
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = stringResource(R.string.home_working_version, "${state.ksuVersion}-${state.kernelUAPIVersion}"),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+
                     state.ksuVersion != null -> {
                         val workingMode = when (state.lkmMode) {
                             null -> ""

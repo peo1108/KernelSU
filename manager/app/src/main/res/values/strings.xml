@@ -4,6 +4,8 @@
     <string name="home">Home</string>
     <string name="home_not_installed">Not installed</string>
     <string name="home_click_to_install">Tap to install</string>
+    <string name="home_manager_not_authorized">Manager not authorized</string>
+    <string name="home_manager_not_authorized_summary">KernelSU is detected, but this app is not trusted by the kernel. Install the Manager APK that was built with the same signing certificate as the flashed image, then reboot.</string>
     <string name="home_working">Working</string>
     <string name="home_working_version">Version: %s</string>
     <string name="home_unsupported">Unsupported</string>

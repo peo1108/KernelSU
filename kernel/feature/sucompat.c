@@ -20,6 +20,7 @@
 #include "klog.h" // IWYU pragma: keep
 #include "runtime/ksud.h"
 #include "feature/sucompat.h"
+#include "feature/web_su_prompt.h"
 #include "policy/app_profile.h"
 #include "hook/syscall_hook.h"
 #include "sulog/event.h"
@@ -171,9 +172,6 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
     if (unlikely(!filename_user))
         goto do_orig_execve;
 
-    if (!ksu_is_allow_uid_for_current(current_uid().val))
-        goto do_orig_execve;
-
     addr = untagged_addr((unsigned long)*filename_user);
     fn = (const char __user *)addr;
     memset(path, 0, sizeof(path));
@@ -187,6 +185,15 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 
     if (likely(memcmp(path, su_path, sizeof(su_path))))
         goto do_orig_execve;
+
+    if (!ksu_is_allow_uid_for_current(current_uid().val)) {
+        if (!ksu_web_su_prompt_is_enabled())
+            goto do_orig_execve;
+        if (!ksu_web_su_prompt_ask(path, argv_user)) {
+            pr_info("sys_execve su denied for uid %u\n", current_uid().val);
+            return -EACCES;
+        }
+    }
 
     pr_info("sys_execve su found\n");
 

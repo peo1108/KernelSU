@@ -9,7 +9,7 @@ use crate::boot_patch::{BootPatchArgs, BootRestoreArgs};
 use crate::module::regenerate_preinit_rc;
 use crate::{
     apk_sign, assets, debug, defs, init_event, ksu_uapi, ksucalls, module, module_config, sulog,
-    utils,
+    utils, webadmin,
 };
 
 /// KernelSU userspace cli
@@ -143,6 +143,12 @@ enum Commands {
     Initrc {
         #[command(subcommand)]
         command: Initrc,
+    },
+
+    /// Run and manage the local web admin panel
+    Web {
+        #[command(subcommand)]
+        command: Web,
     },
 }
 
@@ -477,6 +483,33 @@ enum Initrc {
     Refresh,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Web {
+    /// Start webadmin in the background
+    Start,
+    /// Run webadmin in the foreground
+    Serve,
+    /// Stop background webadmin
+    Stop,
+    /// Show webadmin status
+    Status,
+    /// Print or create the webadmin bearer token
+    Token,
+    /// Manage boot autostart
+    Autostart {
+        #[command(subcommand)]
+        command: WebAutostart,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum WebAutostart {
+    /// Enable webadmin autostart after boot
+    On,
+    /// Disable webadmin autostart
+    Off,
+}
+
 pub fn run() -> Result<()> {
     android_logger::init_once(
         Config::default()
@@ -789,6 +822,20 @@ pub fn run() -> Result<()> {
         },
         Commands::Initrc { command } => match command {
             Initrc::Refresh => regenerate_preinit_rc(),
+        },
+        Commands::Web { command } => match command {
+            Web::Start => webadmin::spawn(),
+            Web::Serve => webadmin::serve(),
+            Web::Stop => webadmin::stop(),
+            Web::Status => {
+                webadmin::status();
+                Ok(())
+            }
+            Web::Token => webadmin::print_token(),
+            Web::Autostart { command } => match command {
+                WebAutostart::On => webadmin::set_autostart(true),
+                WebAutostart::Off => webadmin::set_autostart(false),
+            },
         },
     };
 

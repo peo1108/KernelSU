@@ -1,0 +1,101 @@
+name: Webadmin MVP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/webadmin-mvp.yml"
+      - ".github/scripts/setup-rust-build.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "userspace/**"
+      - "kernel/**"
+      - "uapi/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/webadmin-mvp.yml"
+      - ".github/scripts/setup-rust-build.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "userspace/**"
+      - "kernel/**"
+      - "uapi/**"
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  ksud-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: userspace/ksud
+          cache-targets: false
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Check ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo check --target "$TRIPLE" --manifest-path ./userspace/ksud/Cargo.toml
+
+      - name: Clippy ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo clippy --target "$TRIPLE" --release --manifest-path ./userspace/ksud/Cargo.toml -- -D warnings
+
+      - name: Build ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo build --target "$TRIPLE" --release --manifest-path ./userspace/ksud/Cargo.toml
+
+      - name: Upload ksud artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-webadmin-mvp-aarch64
+          path: target/aarch64-linux-android/release/ksud
+
+  kernel-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Kernel formatting smoke check
+        run: make -C kernel check-format

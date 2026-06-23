@@ -25,6 +25,8 @@
     <string name="home">Trang chủ</string>
     <string name="home_not_installed">Chưa cài đặt</string>
     <string name="home_click_to_install">Nhấn để cài đặt</string>
+    <string name="home_manager_not_authorized">Trình quản lý chưa được xác thực</string>
+    <string name="home_manager_not_authorized_summary">Đã phát hiện KernelSU, nhưng ứng dụng này chưa được kernel tin cậy. Hãy cài APK Manager được build bằng cùng chứng chỉ ký với image đã flash, rồi khởi động lại.</string>
     <string name="home_working">Đang hoạt động</string>
     <string name="home_working_version">Phiên bản: %s</string>
     <string name="home_unsupported">Không được hỗ trợ</string>

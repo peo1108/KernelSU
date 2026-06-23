@@ -52,6 +52,8 @@ mod sulog;
 mod unload;
 #[cfg(target_os = "android")]
 mod utils;
+#[cfg(target_os = "android")]
+mod webadmin;
 
 #[cfg(target_os = "android")]
 #[allow(nonstandard_style, unused, unsafe_op_in_unsafe_fn)]

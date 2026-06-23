@@ -12,6 +12,7 @@ val androidBuildToolsVersion by extra("37.0.0")
 val androidCompileNdkVersion: String by extra(libs.versions.ndk.get())
 val androidSourceCompatibility by extra(JavaVersion.VERSION_21)
 val androidTargetCompatibility by extra(JavaVersion.VERSION_21)
+val minVersionCode = 32522
 val managerVersionCode by extra(getVersionCode())
 val managerVersionName by extra(getVersionName())
 
@@ -27,7 +28,7 @@ fun getGitDescribe(): String {
 
 fun getVersionCode(): Int {
     val commitCount = getGitCommitCount()
-    return 30000 + commitCount
+    return maxOf(minVersionCode, 30000 + commitCount)
 }
 
 fun getVersionName(): String {

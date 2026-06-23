@@ -21,6 +21,7 @@
 #include "sulog/event.h"
 #include "sulog/fd.h"
 #include "supercall/supercall.h"
+#include "feature/web_su_prompt.h"
 
 static int do_grant_root(void __user *arg)
 {
@@ -688,6 +689,35 @@ static int do_disable_escape_to_root(void __user *arg)
     return 0;
 }
 
+static int do_get_su_request_fd(void __user *arg)
+{
+    struct ksu_get_su_request_fd_cmd cmd;
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd))) {
+        pr_err("get_su_request_fd: copy_from_user failed\n");
+        return -EFAULT;
+    }
+
+    if (cmd.flags) {
+        pr_err("get_su_request_fd: unsupported flags 0x%x\n", cmd.flags);
+        return -EINVAL;
+    }
+
+    return ksu_install_su_request_fd();
+}
+
+static int do_respond_su_request(void __user *arg)
+{
+    struct ksu_respond_su_request_cmd cmd;
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd))) {
+        pr_err("respond_su_request: copy_from_user failed\n");
+        return -EFAULT;
+    }
+
+    return ksu_respond_su_request(cmd.request_id, cmd.allow != 0);
+}
+
 // IOCTL handlers mapping table
 // clang-format off
 static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
@@ -773,13 +803,13 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .cmd = KSU_IOCTL_GET_APP_PROFILE,
         .name = "GET_APP_PROFILE",
         .handler = do_get_app_profile,
-        .perm_check = only_manager
+        .perm_check = manager_or_root
     },
     {
         .cmd = KSU_IOCTL_SET_APP_PROFILE,
         .name = "SET_APP_PROFILE",
         .handler = do_set_app_profile,
-        .perm_check = only_manager
+        .perm_check = manager_or_root
     },
     {
         .cmd = KSU_IOCTL_GET_FEATURE,
@@ -834,6 +864,18 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .name = "DISABLE_ESCAPE_TO_ROOT", 
         .handler = do_disable_escape_to_root, 
         .perm_check = only_root 
+    },
+    {
+        .cmd = KSU_IOCTL_GET_SU_REQUEST_FD,
+        .name = "GET_SU_REQUEST_FD",
+        .handler = do_get_su_request_fd,
+        .perm_check = only_root
+    },
+    {
+        .cmd = KSU_IOCTL_RESPOND_SU_REQUEST,
+        .name = "RESPOND_SU_REQUEST",
+        .handler = do_respond_su_request,
+        .perm_check = only_root
     },
     {
         .cmd = 0,

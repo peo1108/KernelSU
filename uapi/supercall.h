@@ -7,7 +7,8 @@
 #include "uapi/app_profile.h"
 
 // 2: allowlist v4 root profile flags
-static const __u32 KERNEL_SU_UAPI_VERSION = 2;
+// 3: web su prompt request fd/response ioctls
+static const __u32 KERNEL_SU_UAPI_VERSION = 3;
 
 /* Magic numbers for reboot hook to install fd */
 static const __u32 KSU_INSTALL_MAGIC1 = 0xDEADBEEF;
@@ -144,6 +145,35 @@ struct ksu_get_sulog_fd_cmd {
     __u32 flags; /* Input: reserved for future use, must be 0 */
 };
 
+#define KSU_SU_REQUEST_EVENT_VERSION 1
+#define KSU_SU_REQUEST_COMM_LEN 16
+#define KSU_SU_REQUEST_PATH_LEN 128
+#define KSU_SU_REQUEST_ARGV_LEN 256
+
+struct ksu_su_request_event {
+    __u16 version;
+    __u16 reserved;
+    __u64 request_id;
+    __u64 deadline_ms;
+    __u32 uid;
+    __u32 euid;
+    __u32 pid;
+    __u32 tgid;
+    __u32 ppid;
+    char comm[KSU_SU_REQUEST_COMM_LEN];
+    char path[KSU_SU_REQUEST_PATH_LEN];
+    char argv[KSU_SU_REQUEST_ARGV_LEN];
+};
+
+struct ksu_get_su_request_fd_cmd {
+    __u32 flags; /* Input: reserved for future use, must be 0 */
+};
+
+struct ksu_respond_su_request_cmd {
+    __u64 request_id; /* Input: request id from ksu_su_request_event */
+    __u8 allow; /* Input: true to allow this request once */
+};
+
 static const __u8 KSU_UMOUNT_WIPE = 0; /* ignore everything and wipe list */
 static const __u8 KSU_UMOUNT_ADD = 1; /* add entry (path + flags) */
 static const __u8 KSU_UMOUNT_DEL = 2; /* delete entry, strcmp */
@@ -176,5 +206,7 @@ static const __u32 KSU_IOCTL_ADD_TRY_UMOUNT = _IOC(_IOC_WRITE, 'K', 18, 0);
 static const __u32 KSU_IOCTL_SET_INIT_PGRP = _IO('K', 19);
 static const __u32 KSU_IOCTL_GET_SULOG_FD = _IOW('K', 20, struct ksu_get_sulog_fd_cmd);
 static const __u32 KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT = _IO('K', 21);
+static const __u32 KSU_IOCTL_GET_SU_REQUEST_FD = _IOW('K', 22, struct ksu_get_su_request_fd_cmd);
+static const __u32 KSU_IOCTL_RESPOND_SU_REQUEST = _IOW('K', 23, struct ksu_respond_su_request_cmd);
 
 #endif

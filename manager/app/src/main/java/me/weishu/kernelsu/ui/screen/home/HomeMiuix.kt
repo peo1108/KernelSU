@@ -239,6 +239,35 @@ private fun StatusCard(
 ) {
     Column {
         when {
+            state.showManagerUnauthorizedWarning -> {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.defaultColors(
+                        color = colorScheme.tertiaryContainer
+                    ),
+                    onClick = {
+                        if (!state.isLateLoadMode) {
+                            actions.onInstallClick()
+                        }
+                    },
+                    showIndication = !state.isLateLoadMode,
+                    pressFeedbackType = PressFeedbackType.Sink
+                ) {
+                    BasicComponent(
+                        title = stringResource(R.string.home_manager_not_authorized),
+                        summary = stringResource(R.string.home_manager_not_authorized_summary),
+                        startAction = {
+                            Icon(
+                                Icons.Rounded.ErrorOutline,
+                                stringResource(R.string.home_manager_not_authorized),
+                                modifier = Modifier.padding(end = 6.dp),
+                                tint = colorScheme.onBackground,
+                            )
+                        }
+                    )
+                }
+            }
+
             state.ksuVersion != null -> {
                 val workingState = buildString {
                     if (state.isSafeMode) {

@@ -956,8 +956,12 @@ fn list_module(path: &str) -> Vec<HashMap<String, String>> {
     modules
 }
 
+pub fn collect_modules() -> Vec<HashMap<String, String>> {
+    list_module(defs::MODULE_DIR)
+}
+
 pub fn list_modules() -> Result<()> {
-    let modules = list_module(defs::MODULE_DIR);
+    let modules = collect_modules();
     println!("{}", serde_json::to_string_pretty(&modules)?);
     Ok(())
 }

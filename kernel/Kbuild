@@ -3,6 +3,7 @@ kernelsu-objs := core/init.o
 kernelsu-objs += feature/kernel_umount.o
 kernelsu-objs += feature/sulog.o
 kernelsu-objs += feature/sucompat.o
+kernelsu-objs += feature/web_su_prompt.o
 
 kernelsu-objs += hook/lsm_hook.o
 kernelsu-objs += hook/setuid_hook.o
@@ -72,11 +73,12 @@ else
 KSU_KERNEL_DIR := $(src)
 endif
 
-ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include
+ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include -I$(KSU_KERNEL_DIR)/..
 
 obj-$(CONFIG_KSU) += kernelsu.o
 
 MDIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+KSU_MIN_VERSION_CODE := 32522
 
 # Workaround bazel
 # https://github.com/tiann/KernelSU/pull/316#issuecomment-1479043219
@@ -103,7 +105,8 @@ endif
 # Calculate version if git version is available
 ifdef KSU_GIT_VERSION_VALID
 # ksu_version: major * 10000 + git version + 200 for historical reasons
-$(eval KSU_VERSION=$(shell expr 30000 + $(KSU_GIT_VERSION)))
+$(eval KSU_COMPUTED_VERSION=$(shell expr 30000 + $(KSU_GIT_VERSION)))
+$(eval KSU_VERSION=$(shell [ $(KSU_COMPUTED_VERSION) -lt $(KSU_MIN_VERSION_CODE) ] && echo $(KSU_MIN_VERSION_CODE) || echo $(KSU_COMPUTED_VERSION)))
 $(info -- KernelSU version: $(KSU_VERSION))
 ccflags-y += -DKSU_VERSION=$(KSU_VERSION)
 else

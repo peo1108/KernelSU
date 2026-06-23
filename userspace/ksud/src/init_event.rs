@@ -98,6 +98,7 @@ pub fn on_post_data_fs() -> Result<()> {
     } else if let Err(e) = crate::feature::init_features() {
         warn!("init features failed: {e}");
     }
+    crate::webadmin::maybe_spawn_autostart();
 
     // execute metamodule post-fs-data script first (priority)
     if let Err(e) = metamodule::exec_stage_script("post-fs-data", true) {

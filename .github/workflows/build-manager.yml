@@ -1,6 +1,7 @@
 name: Build Manager
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main", "dev", "ci" ]
     paths:
@@ -39,6 +40,12 @@ jobs:
       keystore_password: ${{ steps.gen.outputs.keystore_password }}
       key_password: ${{ steps.gen.outputs.key_password }}
     steps:
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
       - name: Generate temporary keystore
         if: github.event_name == 'pull_request'
         id: gen
@@ -61,24 +68,39 @@ jobs:
           echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
 
       - name: Extract certificate hash and size
-        if: github.event_name == 'pull_request'
         id: extract
         env:
-          STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+          PR_STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          # Export DER certificate
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            STORE_FILE=pr-key.jks
+            STORE_ALIAS=pr-key
+            STORE_PASS="$PR_STORE_PASS"
+          else
+            if [ -z "$PROD_KEYSTORE" ] || [ -z "$PROD_KEY_ALIAS" ] || [ -z "$PROD_KEYSTORE_PASSWORD" ] || [ -z "$PROD_KEY_PASSWORD" ]; then
+              echo "::error::Production signing secrets are required so kernelsu.ko can trust the Manager APK from this run."
+              exit 1
+            fi
+            echo "$PROD_KEYSTORE" | base64 -d > prod-key.jks
+            STORE_FILE=prod-key.jks
+            STORE_ALIAS="$PROD_KEY_ALIAS"
+            STORE_PASS="$PROD_KEYSTORE_PASSWORD"
+          fi
+
           keytool -exportcert \
-            -alias pr-key \
-            -keystore pr-key.jks \
+            -alias "$STORE_ALIAS" \
+            -keystore "$STORE_FILE" \
             -storepass "$STORE_PASS" \
             -file pr-cert.der
 
-          # Calculate size in hex
           SIZE_DEC=$(stat -c%s pr-cert.der)
           SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
           echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
 
-          # Calculate SHA256 hash
           HASH=$(sha256sum pr-cert.der | awk '{print $1}')
           echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
 
@@ -89,8 +111,10 @@ jobs:
     needs: generate-key
     uses: ./.github/workflows/build-lkm.yml
     with:
-      expected_size2: ${{ needs.generate-key.outputs.expected_size || '' }}
-      expected_hash2: ${{ needs.generate-key.outputs.expected_hash || '' }}
+      expected_size: ${{ needs.generate-key.outputs.expected_size }}
+      expected_hash: ${{ needs.generate-key.outputs.expected_hash }}
+      expected_size2: ${{ github.event_name == 'pull_request' && needs.generate-key.outputs.expected_size || '' }}
+      expected_hash2: ${{ github.event_name == 'pull_request' && needs.generate-key.outputs.expected_hash || '' }}
     secrets: inherit
 
   build-ksuinit:
@@ -146,17 +170,24 @@ jobs:
           fetch-depth: 0
 
       - name: Write key
-        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' )) || github.ref_type == 'tag' }}
+        if: github.event_name != 'pull_request'
+        env:
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
-            {
-              echo KEYSTORE_PASSWORD='${{ secrets.KEYSTORE_PASSWORD }}'
-              echo KEY_ALIAS='${{ secrets.KEY_ALIAS }}'
-              echo KEY_PASSWORD='${{ secrets.KEY_PASSWORD }}'
-              echo KEYSTORE_FILE='key.jks'
-            } >> gradle.properties
-            echo ${{ secrets.KEYSTORE }} | base64 -d > key.jks
+          if [ -z "$PROD_KEYSTORE" ] || [ -z "$PROD_KEY_ALIAS" ] || [ -z "$PROD_KEYSTORE_PASSWORD" ] || [ -z "$PROD_KEY_PASSWORD" ]; then
+            echo "::error::Production signing secrets are required for Manager release artifacts."
+            exit 1
           fi
+          {
+            echo KEYSTORE_PASSWORD="$PROD_KEYSTORE_PASSWORD"
+            echo KEY_ALIAS="$PROD_KEY_ALIAS"
+            echo KEY_PASSWORD="$PROD_KEY_PASSWORD"
+            echo KEYSTORE_FILE='key.jks'
+          } >> gradle.properties
+          echo "$PROD_KEYSTORE" | base64 -d > key.jks
 
       - name: Write PR key
         if: github.event_name == 'pull_request'
@@ -194,7 +225,6 @@ jobs:
           fi
 
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
         uses: actions/upload-artifact@v7
         with:
           name: manager-gradle
@@ -202,7 +232,7 @@ jobs:
 
       - name: Upload mappings
         uses: actions/upload-artifact@v7
-        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' )) || github.ref_type == 'tag' }}
+        if: github.event_name != 'pull_request'
         with:
           name: "mappings"
           path: "manager/app/build/outputs/mapping/release/"
@@ -225,6 +255,23 @@ jobs:
             echo "UPLOAD=true" >> $GITHUB_OUTPUT
           else
             echo "UPLOAD=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup signing availability
+        id: signing
+        env:
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          elif [ -n "$PROD_KEYSTORE" ] && [ -n "$PROD_KEY_ALIAS" ] && [ -n "$PROD_KEYSTORE_PASSWORD" ] && [ -n "$PROD_KEY_PASSWORD" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "Production signing secrets are not configured; skipping repack/resign."
           fi
 
       - name: Setup Android SDK
@@ -265,7 +312,7 @@ jobs:
           cp -f "$X86_64_KSUD" target/x86_64-linux-android/release/ksud
 
       - name: Prepare signing inputs
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: steps.signing.outputs.available == 'true'
         env:
           PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
           PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
@@ -291,7 +338,7 @@ jobs:
           fi
 
       - name: Repack and resign
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: steps.signing.outputs.available == 'true'
         run: |
           python3 repack_apk.py repack \
             -b release \
@@ -305,14 +352,14 @@ jobs:
             --strip
 
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: steps.signing.outputs.available == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: manager
           path: dist/*.apk
 
       - name: Bot session cache
-        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true'
+        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true' && steps.signing.outputs.available == 'true'
         id: bot_session_cache
         uses: actions/cache@v5
         with:
@@ -320,7 +367,7 @@ jobs:
           key: ${{ runner.os }}-bot-session
 
       - name: Upload to telegram
-        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true'
+        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true' && steps.signing.outputs.available == 'true'
         env:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
