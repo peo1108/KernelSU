@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KernelSU Web Admin Demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0d1115;
+      color: #e7edf3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, rgba(32, 43, 52, 0.95), rgba(13, 17, 21, 1) 260px),
+        #0d1115;
+      color: #e7edf3;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 20px;
+      border-bottom: 1px solid rgba(151, 166, 181, 0.18);
+      background: rgba(14, 19, 24, 0.82);
+      backdrop-filter: blur(14px);
+      position: sticky;
+      top: 0;
+      z-index: 4;
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 680;
+      letter-spacing: 0;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      border: 1px solid rgba(96, 125, 139, 0.45);
+      border-radius: 6px;
+      padding: 4px 9px;
+      color: #a9bac7;
+      background: rgba(22, 29, 36, 0.8);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    main {
+      display: grid;
+      grid-template-columns: 226px minmax(0, 1fr);
+      min-height: calc(100vh - 58px);
+    }
+    nav {
+      padding: 14px;
+      border-right: 1px solid rgba(151, 166, 181, 0.16);
+      background: rgba(12, 16, 20, 0.55);
+    }
+    nav button, .btn {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid rgba(102, 124, 140, 0.38);
+      border-radius: 6px;
+      background: #161d23;
+      color: #d9e3ea;
+      padding: 8px 10px;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+    nav button {
+      margin-bottom: 8px;
+    }
+    nav button.active {
+      background: #245b78;
+      border-color: #58a9d2;
+      color: white;
+    }
+    .btn {
+      width: auto;
+      text-align: center;
+    }
+    .btn.ok { background: #1f5439; border-color: #3c9463; }
+    .btn.warn { background: #57401f; border-color: #9b7a3e; }
+    .btn.danger { background: #692a31; border-color: #aa5660; }
+    .content {
+      padding: 18px;
+      max-width: 1180px;
+      width: 100%;
+    }
+    section { display: none; }
+    section.active { display: block; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .card {
+      border: 1px solid rgba(151, 166, 181, 0.17);
+      border-radius: 8px;
+      background: rgba(19, 26, 32, 0.92);
+      padding: 14px;
+      box-shadow: 0 12px 34px rgba(0, 0, 0, 0.18);
+    }
+    .card h2, .card h3 {
+      margin: 0 0 8px;
+      font-size: 15px;
+      letter-spacing: 0;
+    }
+    .muted { color: #9aabb8; }
+    .small { font-size: 12px; }
+    .metric {
+      font-size: 26px;
+      font-weight: 720;
+      margin-top: 6px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .item {
+      border: 1px solid rgba(151, 166, 181, 0.16);
+      border-radius: 8px;
+      background: rgba(18, 25, 31, 0.86);
+      padding: 13px;
+      margin: 10px 0;
+    }
+    .line {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      border-top: 1px solid rgba(151, 166, 181, 0.12);
+      padding-top: 10px;
+      margin-top: 10px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(151, 166, 181, 0.24);
+      color: #b8c7d2;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pill.on { color: #adf2c8; border-color: rgba(72, 186, 119, 0.6); }
+    .pill.off { color: #f2c6c9; border-color: rgba(196, 91, 101, 0.55); }
+    input {
+      min-height: 38px;
+      min-width: 280px;
+      border-radius: 6px;
+      border: 1px solid rgba(102, 124, 140, 0.42);
+      background: #0c1116;
+      color: #eef5f9;
+      padding: 8px 10px;
+      font: inherit;
+    }
+    code, pre {
+      color: #cce5f7;
+      background: rgba(8, 12, 16, 0.9);
+      border-radius: 6px;
+    }
+    pre {
+      overflow: auto;
+      padding: 12px;
+      margin: 0;
+      line-height: 1.45;
+    }
+    @media (max-width: 820px) {
+      main { grid-template-columns: 1fr; }
+      nav {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        border-right: 0;
+        border-bottom: 1px solid rgba(151, 166, 181, 0.16);
+      }
+      nav button { margin: 0; }
+      .grid { grid-template-columns: 1fr; }
+      header { align-items: flex-start; flex-direction: column; }
+      input { min-width: 0; width: 100%; }
+      .line { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>KernelSU Web Admin Demo</h1>
+      <div class="muted small">Static mock preview. The Android build serves the real panel from ksud on 127.0.0.1:9700.</div>
+    </div>
+    <span class="badge" id="auth-state">demo token loaded</span>
+  </header>
+  <main>
+    <nav>
+      <button class="active" data-tab="status">Status</button>
+      <button data-tab="su">Superuser</button>
+      <button data-tab="features">Features</button>
+      <button data-tab="modules">Modules</button>
+    </nav>
+    <div class="content">
+      <section id="status" class="active">
+        <div class="grid">
+          <div class="card"><h2>Kernel</h2><div class="metric">32580</div><div class="muted small">UAPI 3, LKM mode</div></div>
+          <div class="card"><h2>Prompt</h2><div class="metric">1 pending</div><div class="muted small">15s deny timeout</div></div>
+          <div class="card"><h2>Bind</h2><div class="metric">127.0.0.1</div><div class="muted small">Bearer token required for API</div></div>
+        </div>
+        <div class="card">
+          <h2>Session</h2>
+          <div class="row">
+            <input value="demo-token-64-byte-placeholder" aria-label="Bearer token">
+            <button class="btn">Save token</button>
+          </div>
+          <div class="line">
+            <span class="muted">Real command</span>
+            <code>ksud web token && ksud web start && ksud feature set web_su_prompt 1</code>
+          </div>
+        </div>
+      </section>
+
+      <section id="su">
+        <div class="item" id="request-card">
+          <div class="line" style="border-top:0;padding-top:0;margin-top:0">
+            <div>
+              <h3>com.termux</h3>
+              <div class="muted small">uid 10245, pid 18422, comm sh</div>
+              <div style="margin-top:8px"><code>/system/bin/su -c id</code></div>
+            </div>
+            <span class="pill on">waiting</span>
+          </div>
+          <div class="row">
+            <button class="btn ok" onclick="resolveRequest('Allowed once')">Allow once</button>
+            <button class="btn ok" onclick="resolveRequest('Allowed and remembered')">Allow and remember</button>
+            <button class="btn danger" onclick="resolveRequest('Denied')">Deny</button>
+          </div>
+        </div>
+        <div class="item">
+          <h3>Recent decisions</h3>
+          <div id="decision-log" class="muted small">No local demo decisions yet.</div>
+        </div>
+      </section>
+
+      <section id="features">
+        <div id="features-list"></div>
+      </section>
+
+      <section id="modules">
+        <div id="modules-list"></div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const state = {
+      features: [
+        ['su_compat', true, 'Redirect authorized /system/bin/su calls to ksud.'],
+        ['kernel_umount', true, 'Unmount modules from apps that should not see them.'],
+        ['sulog', false, 'Persist root/sucompat events to disk.'],
+        ['adb_root', false, 'Allow adbd root when supported.'],
+        ['selinux_hide', true, 'Hide SELinux signals from app UIDs.'],
+        ['web_su_prompt', true, 'Ask this local web panel before first-time root grant.']
+      ],
+      modules: [
+        ['zygisk-next', true, 'Zygisk compatibility layer', 'v1.2.3'],
+        ['hosts-block', false, 'Systemless hosts rules', 'v4.1'],
+        ['meta-overlayfs', true, 'Metamodule overlay hook', 'demo']
+      ]
+    };
+
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    }
+    function renderFeatures() {
+      document.getElementById('features-list').innerHTML = state.features.map((f, idx) => `
+        <div class="item">
+          <div class="line" style="border-top:0;padding-top:0;margin-top:0">
+            <div><h3>${esc(f[0])}</h3><div class="muted small">${esc(f[2])}</div></div>
+            <span class="pill ${f[1] ? 'on' : 'off'}">${f[1] ? 'enabled' : 'disabled'}</span>
+          </div>
+          <div class="row"><button class="btn" onclick="toggleFeature(${idx})">${f[1] ? 'Disable' : 'Enable'}</button></div>
+        </div>`).join('');
+    }
+    function renderModules() {
+      document.getElementById('modules-list').innerHTML = state.modules.map((m, idx) => `
+        <div class="item">
+          <div class="line" style="border-top:0;padding-top:0;margin-top:0">
+            <div><h3>${esc(m[0])}</h3><div class="muted small">${esc(m[3])} - ${esc(m[2])}</div></div>
+            <span class="pill ${m[1] ? 'on' : 'off'}">${m[1] ? 'enabled' : 'disabled'}</span>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="toggleModule(${idx})">${m[1] ? 'Disable' : 'Enable'}</button>
+            <button class="btn danger" onclick="removeModule(${idx})">Uninstall</button>
+          </div>
+        </div>`).join('') || '<div class="item muted">No modules left in demo.</div>';
+    }
+    function toggleFeature(idx) { state.features[idx][1] = !state.features[idx][1]; renderFeatures(); }
+    function toggleModule(idx) { state.modules[idx][1] = !state.modules[idx][1]; renderModules(); }
+    function removeModule(idx) { state.modules.splice(idx, 1); renderModules(); }
+    function resolveRequest(text) {
+      document.getElementById('request-card').innerHTML = '<h3>No pending requests</h3><div class="muted small">The demo request was resolved.</div>';
+      document.getElementById('decision-log').textContent = text + ' for com.termux at ' + new Date().toLocaleTimeString();
+    }
+    document.querySelectorAll('nav button').forEach(button => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('nav button, section').forEach(el => el.classList.remove('active'));
+        button.classList.add('active');
+        document.getElementById(button.dataset.tab).classList.add('active');
+      });
+    });
+    renderFeatures();
+    renderModules();
+  </script>
+</body>
+</html>
