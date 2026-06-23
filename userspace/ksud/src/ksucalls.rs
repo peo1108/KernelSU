@@ -250,16 +250,14 @@ fn write_c_string(dst: &mut [c_char], value: &str) -> Result<()> {
 fn read_c_string(src: &[c_char]) -> String {
     let bytes = src
         .iter()
-        .map(|v| *v)
+        .copied()
         .take_while(|v| *v != 0)
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&bytes).to_string()
 }
 
 fn caps_to_list(bits: u64) -> Vec<i32> {
-    (0..64)
-        .filter(|cap| bits & (1u64 << cap) != 0)
-        .collect()
+    (0..64).filter(|cap| bits & (1u64 << cap) != 0).collect()
 }
 
 fn cap_list_to_bits(caps: &[i32]) -> Result<u64> {
