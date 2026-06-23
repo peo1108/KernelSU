@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -7,12 +7,12 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{defs, ksucalls, module, utils};
+use crate::{defs, ksucalls, module, profile, utils};
 
 const LISTEN_ADDR: &str = "127.0.0.1:9700";
 const TOKEN_PATH: &str = concat!("/data/adb/ksu/", "webadmin.token");
@@ -21,6 +21,8 @@ const PID_PATH: &str = concat!("/data/adb/ksu/", "webadmin.pid");
 const READ_BUF_SIZE: usize = 8192;
 const EVENT_HEADER_SIZE: usize = 24;
 const DROPPED_RECORD_TYPE: u16 = 0xffff;
+const JSON_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const MODULE_UPLOAD_LIMIT: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct SuRequest {
@@ -47,6 +49,7 @@ struct HttpRequest {
     path: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    upload_path: Option<PathBuf>,
 }
 
 struct EventHeader {
@@ -180,6 +183,22 @@ fn is_running() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+fn is_module_install_request(method: &str, path: &str) -> bool {
+    method == "POST" && path.split('?').next() == Some("/api/v1/modules/install")
+}
+
+fn temp_upload_path() -> Result<PathBuf> {
+    ensure_working_dir()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(Path::new(defs::WORKING_DIR).join(format!(
+        "webadmin-upload-{}-{now}.zip",
+        std::process::id()
+    )))
+}
+
 fn parse_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
@@ -221,25 +240,58 @@ fn parse_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .get("content-length")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
-    if content_len > 2 * 1024 * 1024 {
-        bail!("request body too large");
-    }
 
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_len {
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            bail!("connection closed before body");
+    let mut body = Vec::new();
+    let mut upload_path = None;
+    if is_module_install_request(&method, &path) {
+        if content_len > MODULE_UPLOAD_LIMIT {
+            bail!("module zip too large");
         }
-        body.extend_from_slice(&tmp[..n]);
+        let path = temp_upload_path()?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .context("create upload temp file")?;
+        let mut written = 0usize;
+        let initial = &buf[header_end..];
+        let initial_len = initial.len().min(content_len);
+        file.write_all(&initial[..initial_len])?;
+        written += initial_len;
+        while written < content_len {
+            let n = stream.read(&mut tmp)?;
+            if n == 0 {
+                bail!("connection closed before body");
+            }
+            let remaining = content_len - written;
+            let take = n.min(remaining);
+            file.write_all(&tmp[..take])?;
+            written += take;
+        }
+        file.sync_all()?;
+        upload_path = Some(path);
+    } else {
+        if content_len > JSON_BODY_LIMIT {
+            bail!("request body too large");
+        }
+        body = buf[header_end..].to_vec();
+        while body.len() < content_len {
+            let n = stream.read(&mut tmp)?;
+            if n == 0 {
+                bail!("connection closed before body");
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_len);
     }
-    body.truncate(content_len);
 
     Ok(HttpRequest {
         method,
         path,
         headers,
         body,
+        upload_path,
     })
 }
 
@@ -287,6 +339,180 @@ fn parse_json_body(req: &HttpRequest) -> Result<Value> {
     Ok(serde_json::from_slice(&req.body)?)
 }
 
+fn api_error(message: impl ToString, code: &str) -> Value {
+    json!({ "error": message.to_string(), "code": code })
+}
+
+fn bool_from_body(body: &Value, key: &str) -> Option<bool> {
+    body.get(key).and_then(Value::as_bool)
+}
+
+fn validate_package_name(package: &str) -> Result<()> {
+    ensure!(!package.is_empty(), "package is empty");
+    ensure!(
+        package.len() < ksu_uapi_max_package_name(),
+        "package name too long"
+    );
+    ensure!(!package.as_bytes().contains(&0), "package contains nul byte");
+    ensure!(
+        package == ksucalls::NON_ROOT_DEFAULT_PROFILE_KEY
+            || package.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':')
+            }),
+        "invalid package name"
+    );
+    Ok(())
+}
+
+const fn ksu_uapi_max_package_name() -> usize {
+    256
+}
+
+fn query_param(path: &str, name: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+fn percent_decode(value: &str) -> String {
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
+        {
+            out.push((high << 4) | low);
+            idx += 3;
+        } else if bytes[idx] == b'+' {
+            out.push(b' ');
+            idx += 1;
+        } else {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn profile_rules(package: &str) -> String {
+    let path = Path::new(defs::PROFILE_SELINUX_DIR).join(package);
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn profile_to_json(profile: &ksucalls::AppProfile, has_profile: bool) -> Value {
+    json!({
+        "name": &profile.name,
+        "currentUid": profile.current_uid,
+        "allowSu": profile.allow_su,
+        "rootUseDefault": profile.root_use_default,
+        "rootTemplate": &profile.root_template,
+        "uid": profile.uid,
+        "gid": profile.gid,
+        "groups": &profile.groups,
+        "capabilities": &profile.capabilities,
+        "context": &profile.context,
+        "namespace": profile.namespace,
+        "nonRootUseDefault": profile.non_root_use_default,
+        "umountModules": profile.umount_modules,
+        "rules": &profile.rules,
+        "flags": profile.flags,
+        "hasProfile": has_profile,
+        "hasCustomProfile": profile.has_custom_profile(),
+    })
+}
+
+fn int_vec_from_json(body: &Value, key: &str) -> Result<Vec<i32>> {
+    let Some(values) = body.get(key).and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|v| {
+            let value = v.as_i64().with_context(|| format!("{key} must contain integers"))?;
+            i32::try_from(value).with_context(|| format!("{key} value overflows i32"))
+        })
+        .collect()
+}
+
+fn profile_from_json(body: &Value, uid: u32, fallback_package: &str) -> Result<ksucalls::AppProfile> {
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_package);
+    validate_package_name(name)?;
+    ensure!(name == fallback_package, "profile package does not match route");
+    let current_uid = body
+        .get("currentUid")
+        .and_then(Value::as_i64)
+        .unwrap_or(i64::from(uid));
+    ensure!(current_uid == i64::from(uid), "profile uid does not match route");
+
+    let mut profile = ksucalls::AppProfile::default_for(name, uid);
+    profile.allow_su = bool_from_body(body, "allowSu").unwrap_or(false);
+    profile.root_use_default = bool_from_body(body, "rootUseDefault").unwrap_or(true);
+    profile.root_template = body
+        .get("rootTemplate")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    profile.uid = body
+        .get("uid")
+        .and_then(Value::as_i64)
+        .map(i32::try_from)
+        .transpose()
+        .context("uid overflows i32")?
+        .unwrap_or(0);
+    profile.gid = body
+        .get("gid")
+        .and_then(Value::as_i64)
+        .map(i32::try_from)
+        .transpose()
+        .context("gid overflows i32")?
+        .unwrap_or(0);
+    profile.groups = int_vec_from_json(body, "groups")?;
+    profile.capabilities = int_vec_from_json(body, "capabilities")?;
+    profile.context = body
+        .get("context")
+        .and_then(Value::as_str)
+        .unwrap_or(ksucalls::KERNEL_SU_DOMAIN)
+        .to_string();
+    profile.namespace = body
+        .get("namespace")
+        .and_then(Value::as_i64)
+        .map(i32::try_from)
+        .transpose()
+        .context("namespace overflows i32")?
+        .unwrap_or(0);
+    ensure!((0..=2).contains(&profile.namespace), "invalid namespace");
+    profile.non_root_use_default = bool_from_body(body, "nonRootUseDefault").unwrap_or(true);
+    profile.umount_modules = bool_from_body(body, "umountModules").unwrap_or(true);
+    profile.rules = body
+        .get("rules")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    profile.flags = body
+        .get("flags")
+        .and_then(Value::as_u64)
+        .unwrap_or(ksucalls::FLAG_KSU_NO_NEW_PRIVS);
+    Ok(profile)
+}
+
 const fn feature_names() -> [(&'static str, u32, &'static str); 6] {
     [
         ("su_compat", 0, "SU compatibility mode"),
@@ -302,6 +528,18 @@ fn feature_id_by_name(name: &str) -> Option<u32> {
     feature_names()
         .iter()
         .find_map(|(feature_name, id, _)| (*feature_name == name).then_some(*id))
+}
+
+fn feature_state(name: &str, id: u32, description: &str) -> Value {
+    let (value, supported) = ksucalls::get_feature(id).unwrap_or((0, false));
+    json!({
+        "name": name,
+        "id": id,
+        "description": description,
+        "value": value,
+        "enabled": value != 0,
+        "supported": supported,
+    })
 }
 
 fn handle_status() -> Value {
@@ -320,17 +558,7 @@ fn handle_status() -> Value {
 fn handle_features() -> Value {
     let features = feature_names()
         .iter()
-        .map(|(name, id, description)| {
-            let (value, supported) = ksucalls::get_feature(*id).unwrap_or((0, false));
-            json!({
-                "name": name,
-                "id": id,
-                "description": description,
-                "value": value,
-                "enabled": value != 0,
-                "supported": supported,
-            })
-        })
+        .map(|(name, id, description)| feature_state(*name, *id, *description))
         .collect::<Vec<_>>();
     json!({ "features": features })
 }
@@ -351,6 +579,85 @@ fn handle_feature_patch(req: &HttpRequest, feature_name: &str) -> Result<Value> 
     Ok(json!({ "ok": true, "name": feature_name, "value": value }))
 }
 
+fn get_prop(name: &str) -> String {
+    utils::getprop(name).unwrap_or_default()
+}
+
+fn read_trimmed(path: &str) -> String {
+    fs::read_to_string(path)
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn selinux_status() -> String {
+    match read_trimmed("/sys/fs/selinux/enforce").as_str() {
+        "1" => "enforcing".to_string(),
+        "0" => "permissive".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn seccomp_status() -> String {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return "unknown".to_string();
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Seccomp:").map(str::trim))
+        .map(|value| match value {
+            "0" => "disabled",
+            "1" => "strict",
+            "2" => "filter",
+            _ => "unknown",
+        })
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn handle_home(state: &Arc<Mutex<WebState>>) -> Value {
+    let info = ksucalls::get_info();
+    let modules = module::collect_modules();
+    let packages = package_index();
+    json!({
+        "status": {
+            "kernelVersion": info.version,
+            "kernelFlags": info.flags,
+            "kernelFeatures": info.features,
+            "kernelUapiVersion": info.uapi_version,
+            "managerUapiVersion": crate::ksu_uapi::KERNEL_SU_UAPI_VERSION,
+            "ksudVersionCode": defs::VERSION_CODE.trim(),
+            "ksudVersionName": defs::VERSION_NAME.trim(),
+            "safeMode": ksucalls::check_kernel_safemode(),
+            "lkmMode": info.flags & crate::ksu_uapi::KSU_GET_INFO_FLAG_LKM != 0,
+            "lateLoad": info.flags & crate::ksu_uapi::KSU_GET_INFO_FLAG_LATE_LOAD != 0,
+            "manager": info.flags & crate::ksu_uapi::KSU_GET_INFO_FLAG_MANAGER != 0,
+            "prBuild": info.flags & crate::ksu_uapi::KSU_GET_INFO_FLAG_PR_BUILD != 0,
+        },
+        "device": {
+            "model": get_prop("ro.product.model"),
+            "manufacturer": get_prop("ro.product.manufacturer"),
+            "device": get_prop("ro.product.device"),
+            "android": get_prop("ro.build.version.release"),
+            "sdk": get_prop("ro.build.version.sdk"),
+            "fingerprint": get_prop("ro.build.fingerprint"),
+        },
+        "security": {
+            "selinux": selinux_status(),
+            "seccomp": seccomp_status(),
+        },
+        "counts": {
+            "superusers": ksucalls::get_allow_list_count(true),
+            "apps": packages.len(),
+            "modules": modules.len(),
+            "pendingRequests": state.lock().expect("web state poisoned").pending.len(),
+        },
+        "links": [
+            {"label": "KernelSU", "url": "https://kernelsu.org/"},
+            {"label": "GitHub", "url": "https://github.com/tiann/KernelSU"}
+        ]
+    })
+}
+
 fn package_index() -> HashMap<u32, Vec<String>> {
     let mut by_uid: HashMap<u32, Vec<String>> = HashMap::new();
     let Ok(content) = fs::read_to_string("/data/system/packages.list") else {
@@ -367,6 +674,114 @@ fn package_index() -> HashMap<u32, Vec<String>> {
         by_uid.entry(uid).or_default().push(pkg.to_string());
     }
     by_uid
+}
+
+fn handle_apps() -> Value {
+    let mut apps = package_index()
+        .into_iter()
+        .map(|(uid, mut packages)| {
+            packages.sort();
+            let package = packages.first().cloned().unwrap_or_default();
+            let (mut profile, has_profile) = ksucalls::get_app_profile(&package, uid)
+                .unwrap_or_else(|_| (ksucalls::AppProfile::default_for(&package, uid), false));
+            profile.rules = profile_rules(&package);
+            json!({
+                "uid": uid,
+                "label": package,
+                "package": package,
+                "packages": packages,
+                "allowSu": profile.allow_su,
+                "hasProfile": has_profile,
+                "hasCustomProfile": profile.has_custom_profile(),
+                "umountModules": profile.umount_modules,
+                "uidShouldUmount": ksucalls::uid_should_umount(uid),
+                "profile": profile_to_json(&profile, has_profile),
+            })
+        })
+        .collect::<Vec<_>>();
+    apps.sort_by(|a, b| {
+        let left = a.get("label").and_then(Value::as_str).unwrap_or_default();
+        let right = b.get("label").and_then(Value::as_str).unwrap_or_default();
+        left.cmp(right)
+    });
+    json!({ "apps": apps })
+}
+
+fn handle_app_profile_get(req: &HttpRequest, uid: u32) -> Result<Value> {
+    let package = query_param(&req.path, "package").context("missing package query")?;
+    validate_package_name(&package)?;
+    let (mut profile, has_profile) = ksucalls::get_app_profile(&package, uid)?;
+    profile.rules = profile_rules(&package);
+    Ok(json!({ "profile": profile_to_json(&profile, has_profile) }))
+}
+
+fn handle_app_profile_put(req: &HttpRequest, uid: u32) -> Result<Value> {
+    let package = query_param(&req.path, "package").context("missing package query")?;
+    validate_package_name(&package)?;
+    let body = parse_json_body(req)?;
+    let profile = profile_from_json(&body, uid, &package)?;
+    if profile.allow_su && !profile.root_use_default && !profile.rules.trim().is_empty() {
+        profile::set_sepolicy(profile.name.clone(), profile.rules.clone())
+            .context("set profile sepolicy")?;
+    } else if !profile.rules.trim().is_empty() {
+        profile::set_sepolicy(profile.name.clone(), profile.rules.clone())
+            .context("set profile sepolicy")?;
+    }
+    ksucalls::set_app_profile(&profile)?;
+    Ok(json!({ "ok": true, "profile": profile_to_json(&profile, true) }))
+}
+
+fn settings_value() -> Value {
+    let features = feature_names()
+        .iter()
+        .map(|(name, id, description)| feature_state(*name, *id, *description))
+        .collect::<Vec<_>>();
+    json!({
+        "features": features,
+        "defaultUmountModules": ksucalls::is_default_umount_modules().unwrap_or(true),
+        "webadminAutostart": Path::new(AUTOSTART_PATH).exists(),
+    })
+}
+
+fn handle_settings() -> Value {
+    json!({ "settings": settings_value() })
+}
+
+fn persist_feature_value(id: u32, value: u64) -> Result<()> {
+    ksucalls::set_feature(id, value).context("set feature")?;
+    let mut config = crate::feature::load_binary_config().unwrap_or_default();
+    config.insert(id, value);
+    crate::feature::save_binary_config(&config).context("save feature config")?;
+    Ok(())
+}
+
+fn handle_settings_patch(req: &HttpRequest) -> Result<Value> {
+    let body = parse_json_body(req)?;
+    if let Some(features) = body.get("features").and_then(Value::as_object) {
+        for (name, value) in features {
+            let id = feature_id_by_name(name).with_context(|| format!("unknown feature: {name}"))?;
+            let enabled = value
+                .as_bool()
+                .or_else(|| value.as_u64().map(|v| v != 0))
+                .context("feature values must be boolean or integer")?;
+            persist_feature_value(id, u64::from(enabled))?;
+            if name == "adb_root" {
+                let _ = Command::new("setprop")
+                    .args(["ctl.restart", "adbd"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+    if let Some(default_umount) = bool_from_body(&body, "defaultUmountModules") {
+        ksucalls::set_default_umount_modules(default_umount)?;
+    }
+    if let Some(autostart) = bool_from_body(&body, "webadminAutostart") {
+        set_autostart(autostart)?;
+    }
+    Ok(json!({ "ok": true, "settings": settings_value() }))
 }
 
 fn string_from_nul(bytes: &[u8]) -> String {
@@ -563,19 +978,90 @@ fn handle_module_action(action: &str, id: &str) -> Result<Value> {
         "enable" => module::enable_module(id)?,
         "disable" => module::disable_module(id)?,
         "uninstall" => module::uninstall_module(id)?,
+        "restore" => module::undo_uninstall_module(id)?,
+        "action" => module::run_action(id)?,
         _ => bail!("unknown module action"),
     }
     Ok(json!({ "ok": true, "id": id, "action": action }))
 }
 
+fn handle_module_install(req: &HttpRequest) -> Result<Value> {
+    let upload_path = req.upload_path.as_ref().context("missing upload")?;
+    let metadata = fs::metadata(upload_path).context("stat upload")?;
+    ensure!(metadata.len() > 0, "empty upload");
+    ensure!(
+        metadata.len() <= MODULE_UPLOAD_LIMIT as u64,
+        "module zip too large"
+    );
+    utils::switch_mnt_ns(1).context("switch to global mount namespace")?;
+    let zip = upload_path
+        .to_str()
+        .context("upload path is not valid utf-8")?
+        .to_string();
+    module::install_module(&zip)?;
+    Ok(json!({ "ok": true, "action": "install" }))
+}
+
+fn content_type_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|v| v.to_str()).unwrap_or_default() {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn module_web_path(path: &str) -> Result<PathBuf> {
+    let rest = path
+        .strip_prefix("/module-web/")
+        .context("missing module web prefix")?;
+    let (id, rel) = rest.split_once('/').unwrap_or((rest, "index.html"));
+    module::validate_module_id(id)?;
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+    ensure!(!rel.starts_with('/'), "invalid module web path");
+    let rel_path = Path::new(rel);
+    ensure!(
+        !rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "invalid module web path"
+    );
+    Ok(Path::new(defs::MODULE_DIR)
+        .join(id)
+        .join(defs::MODULE_WEB_DIR)
+        .join(rel_path))
+}
+
 fn route_api(req: &HttpRequest, state: &Arc<Mutex<WebState>>) -> Result<Value> {
     let path = req.path.split('?').next().unwrap_or(&req.path);
     match (req.method.as_str(), path) {
+        ("GET", "/api/v1/home") => Ok(handle_home(state)),
         ("GET", "/api/v1/status") => Ok(handle_status()),
         ("GET", "/api/v1/features") => Ok(handle_features()),
+        ("GET", "/api/v1/apps") => Ok(handle_apps()),
         ("GET", "/api/v1/modules") => Ok(handle_modules()),
+        ("POST", "/api/v1/modules/install") => handle_module_install(req),
+        ("GET", "/api/v1/settings") => Ok(handle_settings()),
+        ("PATCH", "/api/v1/settings") => handle_settings_patch(req),
         ("GET", "/api/v1/su/requests") => Ok(handle_su_requests(state)),
         _ => {
+            if let Some(rest) = path.strip_prefix("/api/v1/apps/") {
+                let Some(uid_text) = rest.strip_suffix("/profile") else {
+                    bail!("unknown app endpoint");
+                };
+                let uid = uid_text.parse::<u32>().context("invalid uid")?;
+                return match req.method.as_str() {
+                    "GET" => handle_app_profile_get(req, uid),
+                    "PUT" => handle_app_profile_put(req, uid),
+                    _ => bail!("unknown app profile method"),
+                };
+            }
             if req.method == "PATCH"
                 && let Some(name) = path.strip_prefix("/api/v1/features/")
             {
@@ -611,30 +1097,30 @@ fn handle_connection(
     let req = parse_http_request(&mut stream)?;
     let path = req.path.split('?').next().unwrap_or(&req.path);
 
-    if path.starts_with("/api/") {
+    let result = if path.starts_with("/api/") {
         if !is_authorized(&req, token) {
-            return write_json(
+            write_json(
                 &mut stream,
                 "401 Unauthorized",
-                &json!({ "error": "unauthorized" }),
-            );
-        }
-        if matches!(req.method.as_str(), "POST" | "PATCH" | "PUT" | "DELETE")
+                &api_error("unauthorized", "unauthorized"),
+            )
+        } else if matches!(req.method.as_str(), "POST" | "PATCH" | "PUT" | "DELETE")
             && !origin_allowed(&req)
         {
-            return write_json(
+            write_json(
                 &mut stream,
                 "403 Forbidden",
-                &json!({ "error": "bad origin" }),
-            );
-        }
-        match route_api(&req, state) {
-            Ok(value) => write_json(&mut stream, "200 OK", &value),
-            Err(err) => write_json(
-                &mut stream,
-                "400 Bad Request",
-                &json!({ "error": err.to_string() }),
-            ),
+                &api_error("bad origin", "bad_origin"),
+            )
+        } else {
+            match route_api(&req, state) {
+                Ok(value) => write_json(&mut stream, "200 OK", &value),
+                Err(err) => write_json(
+                    &mut stream,
+                    "400 Bad Request",
+                    &api_error(err, "bad_request"),
+                ),
+            }
         }
     } else if req.method == "GET" && (path == "/" || path == "/index.html") {
         write_response(
@@ -643,6 +1129,19 @@ fn handle_connection(
             "text/html; charset=utf-8",
             INDEX_HTML.as_bytes(),
         )
+    } else if req.method == "GET" && path.starts_with("/module-web/") {
+        match module_web_path(path).and_then(|file| {
+            let body = fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            Ok((content_type_for(&file), body))
+        }) {
+            Ok((content_type, body)) => write_response(&mut stream, "200 OK", content_type, &body),
+            Err(_) => write_response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found\n",
+            ),
+        }
     } else {
         write_response(
             &mut stream,
@@ -650,7 +1149,12 @@ fn handle_connection(
             "text/plain; charset=utf-8",
             b"not found\n",
         )
+    };
+
+    if let Some(upload_path) = &req.upload_path {
+        let _ = fs::remove_file(upload_path);
     }
+    result
 }
 
 pub fn serve() -> Result<()> {
@@ -680,51 +1184,435 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>KernelSU Web Manager</title>
+  <style>
+    :root{
+      color-scheme:light;
+      --bg:#f5f7fb;
+      --surface:#ffffff;
+      --surface-2:#eef3fa;
+      --ink:#17202a;
+      --muted:#687589;
+      --line:#dfe6f0;
+      --accent:#18a058;
+      --blue:#2563eb;
+      --warn:#c47a00;
+      --danger:#d92d20;
+      --shadow:0 10px 28px rgba(18,32,54,.09);
+      --radius:8px;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    }
+    *{box-sizing:border-box}
+    html,body{min-height:100%;margin:0;background:var(--bg);color:var(--ink);letter-spacing:0}
+    body{
+      background:
+        radial-gradient(circle at top left,rgba(24,160,88,.16),transparent 30rem),
+        radial-gradient(circle at 90% 10%,rgba(37,99,235,.13),transparent 26rem),
+        linear-gradient(180deg,#fbfcff 0,#f5f7fb 48%,#eef3fa 100%);
+    }
+    button,input,select,textarea{font:inherit}
+    button{border:0;border-radius:8px;background:var(--surface-2);color:var(--ink);min-height:38px;padding:0 13px;cursor:pointer}
+    button:hover{filter:brightness(.98)}
+    button.primary{background:var(--accent);color:white}
+    button.blue{background:var(--blue);color:white}
+    button.danger{background:#fff0ee;color:var(--danger)}
+    button.ghost{background:transparent;border:1px solid var(--line)}
+    button.icon{width:38px;padding:0;display:inline-grid;place-items:center}
+    input,select,textarea{width:100%;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);padding:10px 12px;outline:none}
+    textarea{min-height:112px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+    input:focus,select:focus,textarea:focus{border-color:#8dc7a7;box-shadow:0 0 0 3px rgba(24,160,88,.14)}
+    .app{display:grid;grid-template-columns:248px minmax(0,1fr);min-height:100vh}
+    aside{position:sticky;top:0;height:100vh;padding:22px 16px;border-right:1px solid var(--line);background:rgba(255,255,255,.72);backdrop-filter:blur(18px)}
+    .brand{display:flex;align-items:center;gap:12px;padding:8px 8px 20px}
+    .logo{width:42px;height:42px;border-radius:8px;background:linear-gradient(145deg,var(--accent),#6ee7b7);display:grid;place-items:center;color:#fff;font-weight:800;box-shadow:var(--shadow)}
+    .brand b{display:block;font-size:18px}.brand span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+    nav{display:grid;gap:8px}
+    nav button{height:46px;display:grid;grid-template-columns:28px 1fr auto;align-items:center;text-align:left;background:transparent;color:var(--muted)}
+    nav button.active{background:#e9f7ef;color:#0f7a40;font-weight:700}
+    .badge{min-width:24px;height:24px;border-radius:999px;background:#eef3fa;color:var(--muted);display:inline-grid;place-items:center;font-size:12px;padding:0 7px}
+    .badge.hot{background:#fff0ee;color:var(--danger)}
+    main{min-width:0;padding:26px 28px 96px}
+    .topbar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:center;margin-bottom:22px}
+    h1{margin:0;font-size:30px;line-height:1.1}
+    .subtitle{color:var(--muted);margin-top:6px}
+    .auth{display:flex;gap:8px;align-items:center;min-width:min(420px,42vw)}
+    .auth input{height:40px}
+    section{display:none}.show{display:block}
+    .grid{display:grid;gap:14px}
+    .cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+    .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .panel,.card{background:rgba(255,255,255,.82);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}
+    .panel{padding:18px}.card{padding:15px}
+    .hero{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(260px,.7fr);gap:14px;align-items:stretch}
+    .status-card{min-height:214px;color:white;background:linear-gradient(135deg,#159957,#155799);border:0;display:flex;flex-direction:column;justify-content:space-between}
+    .status-card .kicker{opacity:.86}.status-card h2{margin:8px 0 0;font-size:36px;line-height:1}
+    .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}.chip{border-radius:999px;background:rgba(255,255,255,.18);padding:7px 10px;font-size:13px}
+    .metric{display:flex;justify-content:space-between;align-items:center;gap:12px}.metric b{font-size:26px}.muted{color:var(--muted)}.small{font-size:12px}
+    .toolbar{display:grid;grid-template-columns:minmax(180px,1fr) auto auto;gap:10px;align-items:center;margin-bottom:14px}
+    .list{display:grid;gap:10px}
+    .row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center;background:rgba(255,255,255,.78);border:1px solid var(--line);border-radius:8px;padding:12px}
+    .avatar{width:42px;height:42px;border-radius:8px;background:#e9f7ef;color:#0f7a40;display:grid;place-items:center;font-weight:800}
+    .title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta{color:var(--muted);font-size:13px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    .switch{position:relative;display:inline-flex;align-items:center;gap:10px;cursor:pointer}
+    .switch input{position:absolute;opacity:0;width:1px;height:1px}
+    .track{width:46px;height:26px;border-radius:999px;background:#d7e0eb;position:relative;transition:.18s}
+    .track::after{content:"";position:absolute;width:22px;height:22px;left:2px;top:2px;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.22);transition:.18s}
+    .switch input:checked + .track{background:var(--accent)}.switch input:checked + .track::after{transform:translateX(20px)}
+    .setting{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:14px 0;border-bottom:1px solid var(--line)}
+    .setting:last-child{border-bottom:0}
+    .install{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .empty{padding:28px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:8px;background:rgba(255,255,255,.5)}
+    .toast{position:fixed;right:18px;bottom:18px;z-index:50;display:grid;gap:8px}
+    .toast div{background:#17202a;color:#fff;padding:12px 14px;border-radius:8px;box-shadow:var(--shadow);max-width:min(430px,calc(100vw - 36px))}
+    dialog{border:0;border-radius:8px;padding:0;width:min(760px,calc(100vw - 28px));box-shadow:0 28px 80px rgba(0,0,0,.28)}
+    dialog::backdrop{background:rgba(14,23,38,.42);backdrop-filter:blur(4px)}
+    .modal-head,.modal-foot{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:16px 18px;border-bottom:1px solid var(--line)}
+    .modal-foot{border-top:1px solid var(--line);border-bottom:0;justify-content:flex-end}
+    .modal-body{padding:18px;max-height:min(72vh,720px);overflow:auto}
+    .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.form-grid .wide{grid-column:1/-1}
+    label span{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+    .mobile-tabs{display:none}
+    @media(max-width:900px){
+      .app{display:block}aside{display:none}main{padding:18px 14px 86px}.topbar{grid-template-columns:1fr}.auth{min-width:0}.hero,.cols-3,.cols-2{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr 1fr}.toolbar input{grid-column:1/-1}
+      .row{grid-template-columns:auto minmax(0,1fr)}.actions{grid-column:1/-1;justify-content:stretch}.actions button{flex:1}
+      .form-grid{grid-template-columns:1fr}.mobile-tabs{position:fixed;z-index:40;display:grid;grid-template-columns:repeat(4,1fr);gap:6px;left:10px;right:10px;bottom:10px;background:rgba(255,255,255,.88);border:1px solid var(--line);border-radius:8px;padding:8px;backdrop-filter:blur(18px);box-shadow:var(--shadow)}
+      .mobile-tabs button{font-size:12px;padding:0 6px}.mobile-tabs button.active{background:#e9f7ef;color:#0f7a40;font-weight:700}
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand"><div class="logo">K</div><div><b>KernelSU</b><span>Web Manager</span></div></div>
+      <nav id="sideTabs"></nav>
+    </aside>
+    <main>
+      <div class="topbar">
+        <div><h1 id="title">Home</h1><div id="subtitle" class="subtitle">Device and KernelSU status</div></div>
+        <div class="auth">
+          <input id="token" type="password" placeholder="Bearer token">
+          <button id="saveToken" class="primary">Save</button>
+          <button id="refresh" class="ghost icon" title="Refresh">R</button>
+        </div>
+      </div>
+
+      <section id="home" class="show">
+        <div class="hero">
+          <div id="homeStatus" class="panel status-card"></div>
+          <div class="grid">
+            <div class="panel"><div class="metric"><span>Superuser</span><b id="countSu">0</b></div></div>
+            <div class="panel"><div class="metric"><span>Modules</span><b id="countModules">0</b></div></div>
+            <div class="panel"><div class="metric"><span>Apps</span><b id="countApps">0</b></div></div>
+          </div>
+        </div>
+        <div class="grid cols-2" style="margin-top:14px">
+          <div class="panel"><h3>Device</h3><div id="deviceInfo" class="grid"></div></div>
+          <div class="panel"><h3>Security</h3><div id="securityInfo" class="grid"></div></div>
+        </div>
+      </section>
+
+      <section id="superuser">
+        <div class="toolbar">
+          <input id="appSearch" placeholder="Search app or package">
+          <select id="appFilter"><option value="all">All apps</option><option value="root">Root allowed</option><option value="custom">Custom profile</option><option value="umount">Will umount</option></select>
+          <button id="loadRequests" class="ghost">Requests <span id="requestBadge" class="badge">0</span></button>
+        </div>
+        <div id="requests" class="list" style="margin-bottom:14px"></div>
+        <div id="apps" class="list"></div>
+      </section>
+
+      <section id="module">
+        <div class="toolbar">
+          <input id="moduleSearch" placeholder="Search module">
+          <div class="install"><input id="zipFile" type="file" accept=".zip,application/zip"><button id="installZip" class="blue">Install</button></div>
+          <button id="reloadModules" class="ghost">Reload</button>
+        </div>
+        <div id="modules" class="list"></div>
+      </section>
+
+      <section id="settings">
+        <div class="panel">
+          <div id="settingsList"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div id="mobileTabs" class="mobile-tabs"></div>
+  <div id="toast" class="toast"></div>
+
+  <dialog id="profileDialog">
+    <div class="modal-head"><strong id="profileTitle">App profile</strong><button class="icon ghost" onclick="profileDialog.close()">X</button></div>
+    <form id="profileForm">
+      <div class="modal-body">
+        <div class="form-grid">
+          <label class="wide"><span>Package</span><input name="name" readonly></label>
+          <label><span>Current UID</span><input name="currentUid" readonly></label>
+          <label><span>Namespace</span><select name="namespace"><option value="0">Inherited</option><option value="1">Global</option><option value="2">Individual</option></select></label>
+          <label class="wide switch"><input name="allowSu" type="checkbox"><span class="track"></span><strong>Allow root access</strong></label>
+          <label class="wide switch"><input name="rootUseDefault" type="checkbox"><span class="track"></span><strong>Use default root profile</strong></label>
+          <label><span>Root UID</span><input name="uid" type="number"></label>
+          <label><span>Root GID</span><input name="gid" type="number"></label>
+          <label><span>Groups, comma separated</span><input name="groups"></label>
+          <label><span>Capabilities, comma separated</span><input name="capabilities"></label>
+          <label class="wide"><span>SELinux context</span><input name="context"></label>
+          <label class="wide"><span>Root template</span><input name="rootTemplate"></label>
+          <label class="wide switch"><input name="nonRootUseDefault" type="checkbox"><span class="track"></span><strong>Use default non-root profile</strong></label>
+          <label class="wide switch"><input name="umountModules" type="checkbox"><span class="track"></span><strong>Unmount modules for this app</strong></label>
+          <label><span>Flags</span><input name="flags" type="number"></label>
+          <label class="wide"><span>SEPolicy rules</span><textarea name="rules" spellcheck="false"></textarea></label>
+        </div>
+      </div>
+      <div class="modal-foot"><button type="button" class="ghost" onclick="profileDialog.close()">Cancel</button><button class="primary">Save profile</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog">
+    <div class="modal-head"><strong id="confirmTitle">Confirm</strong></div>
+    <div class="modal-body"><p id="confirmText"></p></div>
+    <div class="modal-foot"><button id="confirmCancel" class="ghost">Cancel</button><button id="confirmOk" class="danger">Continue</button></div>
+  </dialog>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const tabs = [
+      ['home','H','Home','Device and KernelSU status'],
+      ['superuser','S','Superuser','Apps, profiles, and pending SU requests'],
+      ['module','M','Module','Installed modules and ZIP install'],
+      ['settings','T','Settings','KernelSU feature controls']
+    ];
+    const state = {home:null, apps:[], modules:[], settings:null, profile:null};
+    let activeTab = localStorage.getItem('ksu.web.tab') || 'home';
+    $('token').value = localStorage.getItem('ksu.web.token') || '';
+
+    function esc(v){return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+    function initials(v){return (String(v || 'K').split(/[._-]/).filter(Boolean).slice(0,2).map(s=>s[0]).join('') || 'K').toUpperCase();}
+    function csv(v){return String(v || '').split(',').map(s=>s.trim()).filter(Boolean).map(Number).filter(n=>Number.isFinite(n));}
+    function toast(text){const el=document.createElement('div');el.textContent=text;$('toast').append(el);setTimeout(()=>el.remove(),4200);}
+    function confirmAction(title,text){return new Promise(resolve=>{confirmTitle.textContent=title;confirmText.textContent=text;confirmDialog.showModal();confirmCancel.onclick=()=>{confirmDialog.close();resolve(false)};confirmOk.onclick=()=>{confirmDialog.close();resolve(true)}})}
+    async function api(path,opt={}){
+      const headers = opt.headers || {};
+      if (!(opt.body instanceof File) && !(opt.body instanceof Blob) && opt.body && !headers['Content-Type']) headers['Content-Type']='application/json';
+      headers.Authorization = 'Bearer ' + $('token').value.trim();
+      const res = await fetch(path,{...opt,headers});
+      const type = res.headers.get('content-type') || '';
+      const data = type.includes('json') ? await res.json() : {};
+      if(!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    }
+    $('saveToken').onclick=()=>{localStorage.setItem('ksu.web.token',$('token').value.trim());toast('Token saved');refresh()};
+    $('refresh').onclick=()=>refresh(true);
+
+    function buildTabs(){
+      const html = tabs.map(([id,icon,label])=>`<button data-tab="${id}"><span>${icon}</span><span>${label}</span><span id="badge-${id}" class="badge"></span></button>`).join('');
+      $('sideTabs').innerHTML = html; $('mobileTabs').innerHTML = html;
+      document.querySelectorAll('[data-tab]').forEach(btn=>btn.onclick=()=>setTab(btn.dataset.tab));
+      setTab(activeTab,false);
+    }
+    function setTab(id,load=true){
+      activeTab=id; localStorage.setItem('ksu.web.tab',id);
+      document.querySelectorAll('section').forEach(s=>s.classList.toggle('show',s.id===id));
+      document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));
+      const tab=tabs.find(t=>t[0]===id); $('title').textContent=tab[2]; $('subtitle').textContent=tab[3];
+      if(load) refresh();
+    }
+
+    function kv(label,value){return `<div class="metric"><span>${esc(label)}</span><b class="small">${esc(value || 'unknown')}</b></div>`}
+    async function loadHome(){
+      try{
+        state.home = await api('/api/v1/home');
+        const h=state.home, s=h.status, c=h.counts;
+        homeStatus.innerHTML = `<div><div class="kicker">KernelSU status</div><h2>${s.safeMode?'Safe mode':'Working'}</h2><div class="chips"><span class="chip">Kernel ${esc(s.kernelVersion)}</span><span class="chip">ksud ${esc(s.ksudVersionCode)}</span><span class="chip">${s.lkmMode?'LKM':'GKI'}</span><span class="chip">${s.lateLoad?'Late load':'Normal load'}</span></div></div><div class="small">UAPI ${esc(s.kernelUapiVersion)} / ${esc(s.managerUapiVersion)}</div>`;
+        countSu.textContent=c.superusers; countModules.textContent=c.modules; countApps.textContent=c.apps;
+        $('badge-superuser').textContent = c.pendingRequests || '';
+        $('badge-superuser').classList.toggle('hot', (c.pendingRequests||0)>0);
+        deviceInfo.innerHTML = kv('Model',`${h.device.manufacturer || ''} ${h.device.model || ''}`)+kv('Device',h.device.device)+kv('Android',`${h.device.android || ''} SDK ${h.device.sdk || ''}`)+kv('Fingerprint',h.device.fingerprint);
+        securityInfo.innerHTML = kv('SELinux',h.security.selinux)+kv('Seccomp',h.security.seccomp)+kv('Safe mode',s.safeMode?'enabled':'off')+kv('Manager UID',s.manager?'detected':'unknown');
+      }catch(e){toast(e.message)}
+    }
+
+    function filteredApps(){
+      const q=appSearch.value.toLowerCase(), f=appFilter.value;
+      return state.apps.filter(a=>{
+        const hay=[a.label,a.package,...(a.packages||[])].join(' ').toLowerCase();
+        if(q && !hay.includes(q)) return false;
+        if(f==='root') return a.allowSu;
+        if(f==='custom') return a.hasCustomProfile;
+        if(f==='umount') return a.uidShouldUmount;
+        return true;
+      });
+    }
+    async function loadApps(){
+      try{ const data=await api('/api/v1/apps'); state.apps=data.apps||[]; renderApps(); }
+      catch(e){toast(e.message); renderApps();}
+      loadRequests();
+    }
+    function renderApps(){
+      const list=filteredApps();
+      $('badge-superuser').textContent=state.apps.filter(a=>a.allowSu).length || '';
+      list.length ? appsEl(list) : $('apps').innerHTML='<div class="empty">No apps found.</div>';
+    }
+    function appsEl(items){
+      $('apps').innerHTML = items.map(a=>`<div class="row"><div class="avatar">${esc(initials(a.label))}</div><div><div class="title">${esc(a.label)}</div><div class="meta">uid ${esc(a.uid)} - ${(a.packages||[]).map(esc).join(', ')}</div><div class="chips"><span class="chip">${a.allowSu?'Root allowed':'No root'}</span>${a.hasCustomProfile?'<span class="chip">Custom</span>':''}${a.uidShouldUmount?'<span class="chip">Umount</span>':''}</div></div><div class="actions"><button class="ghost" onclick="openProfile(${a.uid},decodeURIComponent('${encodeURIComponent(a.package||'')}'))">Profile</button></div></div>`).join('');
+    }
+    appSearch.oninput=renderApps; appFilter.onchange=renderApps; loadRequests.onclick=loadRequests;
+
+    async function loadRequests(){
+      try{
+        const data=await api('/api/v1/su/requests'); const requests=data.requests||[];
+        $('requestBadge').textContent=requests.length; $('badge-superuser').textContent=requests.length || state.apps.filter(a=>a.allowSu).length || '';
+        $('badge-superuser').classList.toggle('hot',requests.length>0);
+        $('requests').innerHTML=requests.map(r=>`<div class="row"><div class="avatar">SU</div><div><div class="title">${esc(r.comm || r.path)}</div><div class="meta">uid ${esc(r.uid)} - ${(r.packages||[]).map(esc).join(', ')}</div><div class="meta">${esc(r.argv || '')}</div></div><div class="actions"><button class="primary" onclick="decide(${r.request_id},true)">Allow</button><button class="ghost" onclick="decide(${r.request_id},true,true)">Allow and remember</button><button class="danger" onclick="decide(${r.request_id},false)">Deny</button></div></div>`).join('');
+      }catch(e){toast(e.message)}
+    }
+    async function decide(id,allow,remember=false){
+      if(!await confirmAction('SU request', `${allow?'Allow':'Deny'} this request${remember?' and remember it':''}?`)) return;
+      await api(`/api/v1/su/requests/${id}/decision`,{method:'POST',body:JSON.stringify({decision:allow?'allow':'deny',remember})});
+      loadRequests(); loadApps();
+    }
+
+    async function openProfile(uid,pkg){
+      try{
+        const data=await api(`/api/v1/apps/${uid}/profile?package=${encodeURIComponent(pkg)}`);
+        state.profile=data.profile; fillProfile(data.profile); profileDialog.showModal();
+      }catch(e){toast(e.message)}
+    }
+    function fillProfile(p){
+      profileTitle.textContent = p.name;
+      const f=profileForm.elements;
+      for(const key of ['name','currentUid','uid','gid','context','namespace','rootTemplate','rules','flags']) f[key].value = p[key] ?? '';
+      f.allowSu.checked=!!p.allowSu; f.rootUseDefault.checked=!!p.rootUseDefault; f.nonRootUseDefault.checked=!!p.nonRootUseDefault; f.umountModules.checked=!!p.umountModules;
+      f.groups.value=(p.groups||[]).join(','); f.capabilities.value=(p.capabilities||[]).join(',');
+    }
+    profileForm.onsubmit=async(ev)=>{
+      ev.preventDefault();
+      if(!state.profile) return;
+      if(!await confirmAction('Save app profile','This changes root or mount policy for the selected app. Continue?')) return;
+      const f=profileForm.elements;
+      const body={name:f.name.value,currentUid:Number(f.currentUid.value),allowSu:f.allowSu.checked,rootUseDefault:f.rootUseDefault.checked,rootTemplate:f.rootTemplate.value||null,uid:Number(f.uid.value||0),gid:Number(f.gid.value||0),groups:csv(f.groups.value),capabilities:csv(f.capabilities.value),context:f.context.value,namespace:Number(f.namespace.value),nonRootUseDefault:f.nonRootUseDefault.checked,umountModules:f.umountModules.checked,rules:f.rules.value,flags:Number(f.flags.value||0)};
+      try{await api(`/api/v1/apps/${body.currentUid}/profile?package=${encodeURIComponent(body.name)}`,{method:'PUT',body:JSON.stringify(body)}); profileDialog.close(); toast('Profile saved'); loadApps();}
+      catch(e){toast(e.message)}
+    };
+
+    function filteredModules(){
+      const q=moduleSearch.value.toLowerCase();
+      return state.modules.filter(m=>!q || [m.id,m.name,m.author,m.description].join(' ').toLowerCase().includes(q));
+    }
+    async function loadModules(){
+      try{const data=await api('/api/v1/modules'); state.modules=data.modules||[]; renderModules();}
+      catch(e){toast(e.message); renderModules();}
+    }
+    function renderModules(){
+      const list=filteredModules(); $('badge-module').textContent=state.modules.length || '';
+      $('modules').innerHTML=list.length?list.map(m=>{
+        const id=String(m.id||''), enabled=m.enabled==='true', removed=m.remove==='true', web=m.web==='true', action=m.action==='true';
+        const safeId=esc(id), urlId=encodeURIComponent(id);
+        return `<div class="row"><div class="avatar">M</div><div><div class="title">${esc(m.name||m.id)}</div><div class="meta">${esc(m.version||'')} ${m.author?'by '+esc(m.author):''}</div><div class="meta">${esc(m.description||'')}</div><div class="chips"><span class="chip">${enabled?'Enabled':'Disabled'}</span>${removed?'<span class="chip">Remove on reboot</span>':''}${m.update==='true'?'<span class="chip">Updated</span>':''}</div></div><div class="actions"><button class="ghost" onclick="moduleAction('${safeId}','${enabled?'disable':'enable'}')">${enabled?'Disable':'Enable'}</button>${removed?`<button class="ghost" onclick="moduleAction('${safeId}','restore')">Restore</button>`:`<button class="danger" onclick="moduleAction('${safeId}','uninstall')">Uninstall</button>`}${action?`<button class="blue" onclick="moduleAction('${safeId}','action')">Run</button>`:''}${web?`<button class="ghost" onclick="window.open('/module-web/${urlId}/','_blank')">WebUI</button>`:''}</div></div>`
+      }).join(''):'<div class="empty">No modules found.</div>';
+    }
+    moduleSearch.oninput=renderModules; reloadModules.onclick=loadModules;
+    async function moduleAction(id,action){
+      const dangerous=['uninstall','action'].includes(action);
+      if(dangerous && !await confirmAction('Module action', `${action} module ${id}?`)) return;
+      try{await api(`/api/v1/modules/${encodeURIComponent(id)}/${action}`,{method:'POST',body:'{}'}); toast('Module updated'); loadModules(); loadHome();}
+      catch(e){toast(e.message)}
+    }
+    installZip.onclick=async()=>{
+      const file=zipFile.files[0]; if(!file){toast('Choose a ZIP first');return}
+      if(!await confirmAction('Install module',`Install ${file.name}?`)) return;
+      try{await api('/api/v1/modules/install',{method:'POST',body:file,headers:{'Content-Type':'application/zip'}}); toast('Module installed'); zipFile.value=''; loadModules(); loadHome();}
+      catch(e){toast(e.message)}
+    };
+
+    const featureLabels={su_compat:'SU compatibility',kernel_umount:'Kernel umount',sulog:'SU log',adb_root:'ADB root',selinux_hide:'SELinux hide',web_su_prompt:'Web SU prompt'};
+    async function loadSettings(){
+      try{const data=await api('/api/v1/settings'); state.settings=data.settings; renderSettings();}
+      catch(e){toast(e.message); renderSettings();}
+    }
+    function renderSettings(){
+      const s=state.settings; if(!s){$('settingsList').innerHTML='<div class="empty">Settings unavailable.</div>';return}
+      const featureRows=(s.features||[]).map(f=>settingRow(featureLabels[f.name]||f.name,f.description,`feature:${f.name}`,!!f.enabled,!f.supported)).join('');
+      $('settingsList').innerHTML=featureRows+settingRow('Default umount modules','Unmount modules for non-root apps unless overridden','defaultUmountModules',!!s.defaultUmountModules,false)+settingRow('Webadmin autostart','Start web manager after boot','webadminAutostart',!!s.webadminAutostart,false);
+      $('settingsList').querySelectorAll('input[type=checkbox]').forEach(input=>input.onchange=()=>patchSetting(input.dataset.key,input.checked));
+    }
+    function settingRow(title,desc,key,checked,disabled){return `<div class="setting"><div><div class="title">${esc(title)}</div><div class="meta">${esc(desc||'')}</div></div><label class="switch"><input data-key="${esc(key)}" type="checkbox" ${checked?'checked':''} ${disabled?'disabled':''}><span class="track"></span></label></div>`}
+    async function patchSetting(key,enabled){
+      if(!await confirmAction('Change setting',`Set ${key.replace('feature:','')} to ${enabled?'on':'off'}?`)){loadSettings();return}
+      const body = key.startsWith('feature:') ? {features:{[key.slice(8)]:enabled}} : {[key]:enabled};
+      try{const data=await api('/api/v1/settings',{method:'PATCH',body:JSON.stringify(body)}); state.settings=data.settings; renderSettings(); toast('Setting saved');}
+      catch(e){toast(e.message); loadSettings();}
+    }
+
+    function refresh(force=false){
+      if(activeTab==='home') loadHome();
+      if(activeTab==='superuser') loadApps();
+      if(activeTab==='module') loadModules();
+      if(activeTab==='settings') loadSettings();
+    }
+    buildTabs();
+    refresh();
+    setInterval(()=>{ if(activeTab==='superuser') loadRequests(); },3000);
+  </script>
+</body>
+</html>
+"#;
+
+#[allow(dead_code)]
+const _OLD_INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>KernelSU Web Admin</title>
   <style>
     :root{
       color-scheme:light dark;
-      --bg:#f2f2f7;
+      --bg:#07100d;
       --ink:#101418;
       --muted:#5e6b7d;
       --hairline:rgba(23,32,51,.08);
-      --glass:rgba(255,255,255,.30);
-      --glass-strong:rgba(255,255,255,.72);
-      --fill:rgba(255,255,255,.34);
+      --glass:rgba(255,255,255,.72);
+      --glass-strong:rgba(255,255,255,.88);
+      --fill:rgba(255,255,255,.46);
       --field:rgba(255,255,255,.58);
       --control:rgba(255,255,255,.88);
-      --accent:#007aff;
-      --accent-2:#34c759;
-      --warn:#ff9f0a;
-      --danger:#ff3b30;
-      --purple:#8b5cf6;
-      --shadow:0 22px 70px rgba(0,0,0,.22);
-      --radius:24px;
+      --accent:#00c781;
+      --accent-2:#2f7cff;
+      --warn:#f59e0b;
+      --danger:#ef4444;
+      --violet:#7c3aed;
+      --shadow:0 18px 50px rgba(0,0,0,.22);
+      --radius:18px;
       font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;
     }
     @media(prefers-color-scheme:dark){
       :root{
-        --bg:#000;
-        --ink:#f5f8ff;
-        --muted:#b9c4d3;
+        --bg:#07100d;
+        --ink:#f7fbf8;
+        --muted:#9fb2aa;
         --hairline:rgba(255,255,255,.14);
-        --glass:rgba(18,22,30,.42);
-        --glass-strong:rgba(13,18,27,.78);
-        --fill:rgba(255,255,255,.08);
+        --glass:rgba(12,22,18,.76);
+        --glass-strong:rgba(16,28,24,.92);
+        --fill:rgba(255,255,255,.075);
         --field:rgba(255,255,255,.11);
         --control:rgba(255,255,255,.10);
-        --shadow:0 22px 70px rgba(0,0,0,.48);
+        --shadow:0 20px 58px rgba(0,0,0,.38);
       }
     }
     *{box-sizing:border-box}
-    html{min-height:100%;background:var(--bg)}
+    html{min-height:100%;background:var(--bg);overflow-x:hidden}
     body{
       min-height:100vh;
       margin:0;
       color:var(--ink);
-      background:var(--bg);
+      background:
+        linear-gradient(135deg,rgba(0,199,129,.12),transparent 34%),
+        linear-gradient(225deg,rgba(47,124,255,.14),transparent 38%),
+        var(--bg);
       letter-spacing:0;
+      overflow-x:hidden;
     }
     body::before{
       content:"";
@@ -732,30 +1620,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
       inset:0;
       pointer-events:none;
       background:
-        radial-gradient(circle at 42% 12%,rgba(0,122,255,.18),transparent 18rem),
-        radial-gradient(circle at 90% 4%,rgba(139,92,246,.18),transparent 16rem),
-        radial-gradient(ellipse at 48% 45%,rgba(255,255,255,.09),transparent 25rem),
-        repeating-linear-gradient(120deg,transparent 0 86px,rgba(255,255,255,.035) 87px 89px,transparent 90px 176px),
-        repeating-linear-gradient(62deg,transparent 0 132px,rgba(255,255,255,.028) 133px 135px,transparent 136px 252px),
-        linear-gradient(180deg,rgba(9,15,26,.70),rgba(0,0,0,.92));
-      opacity:.95;
+        linear-gradient(rgba(255,255,255,.045) 1px,transparent 1px),
+        linear-gradient(90deg,rgba(255,255,255,.045) 1px,transparent 1px),
+        linear-gradient(120deg,transparent 0 58%,rgba(0,199,129,.10) 58% 59%,transparent 59%),
+        linear-gradient(60deg,transparent 0 44%,rgba(47,124,255,.12) 44% 45%,transparent 45%);
+      background-size:44px 44px,44px 44px,100% 100%,100% 100%;
+      opacity:.82;
     }
     body::after{
       content:"";
       position:fixed;
-      inset:58px 0 0 0;
+      inset:0;
       pointer-events:none;
-      background:
-        radial-gradient(ellipse at 54% 22%,rgba(255,255,255,.08),transparent 20rem),
-        conic-gradient(from 35deg at 52% 34%,transparent,rgba(255,255,255,.055),transparent 26%,rgba(0,122,255,.08),transparent 46%);
-      filter:blur(.2px);
-      opacity:.55;
+      background:linear-gradient(180deg,rgba(7,16,13,.04),rgba(7,16,13,.72));
+      opacity:.9;
     }
     button,input{font:inherit}
     button{
       min-height:38px;
       border:1px solid var(--hairline);
-      border-radius:16px;
+      border-radius:12px;
       color:var(--ink);
       background:var(--control);
       box-shadow:0 1px 0 rgba(255,255,255,.34) inset;
@@ -769,7 +1653,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       width:100%;
       min-height:42px;
       border:1px solid var(--hairline);
-      border-radius:16px;
+      border-radius:12px;
       padding:10px 12px;
       color:var(--ink);
       background:var(--field);
@@ -780,29 +1664,32 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .app{
       position:relative;
       z-index:1;
-      display:block;
+      display:grid;
+      grid-template-columns:136px minmax(0,1fr);
       min-height:100vh;
     }
     .sidebar{
-      display:none;
+      display:grid;
+      grid-template-rows:auto 1fr;
+      gap:24px;
       position:sticky;
       top:0;
       height:100vh;
-      padding:92px 10px 18px;
-      border-right:0;
-      background:rgba(0,0,0,.16);
+      padding:22px 12px;
+      border-right:1px solid var(--hairline);
+      background:rgba(6,15,12,.68);
       backdrop-filter:blur(14px) saturate(1.1);
       -webkit-backdrop-filter:blur(14px) saturate(1.1);
     }
-    .brand{display:none}
+    .brand{display:block;text-align:center}
     .eyebrow{margin:0 0 6px;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase}
-    h1{margin:0;font-size:28px;line-height:1.05;font-weight:760;letter-spacing:0}
+    h1{margin:0;font-size:25px;line-height:1.05;font-weight:760;letter-spacing:0}
     .auth-pill{
       display:inline-flex;
       gap:7px;
       align-items:center;
       min-height:28px;
-      margin-top:14px;
+      margin-top:12px;
       padding:5px 9px;
       border:1px solid var(--hairline);
       border-radius:999px;
@@ -813,7 +1700,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .dot{width:8px;height:8px;border-radius:50%;background:var(--danger);box-shadow:0 0 0 3px color-mix(in srgb,var(--danger),transparent 82%)}
     .auth-pill.ready .dot{background:var(--accent-2);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent-2),transparent 82%)}
-    nav{display:grid;gap:18px}
+    nav{display:grid;align-content:start;gap:12px}
     nav button{
       position:relative;
       display:flex;
@@ -821,7 +1708,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       align-items:center;
       justify-content:center;
       width:78px;
-      min-height:82px;
+      min-height:76px;
       margin:0 auto;
       padding:8px 6px;
       text-align:center;
@@ -832,22 +1719,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     nav button.active{
       color:var(--ink);
-      background:rgba(139,92,246,.28);
-      border-color:rgba(255,255,255,.08);
-      box-shadow:0 10px 30px rgba(0,0,0,.18),0 1px 0 rgba(255,255,255,.16) inset;
+      background:linear-gradient(180deg,rgba(0,199,129,.22),rgba(47,124,255,.12));
+      border-color:rgba(0,199,129,.32);
+      box-shadow:0 12px 30px rgba(0,0,0,.22),0 1px 0 rgba(255,255,255,.16) inset;
     }
     .nav-glyph{
       display:grid;
       place-items:center;
       width:42px;
       height:42px;
-      border-radius:18px;
+      border-radius:14px;
       color:color-mix(in srgb,var(--ink),transparent 6%);
       background:rgba(255,255,255,.10);
       font-size:18px;
       font-weight:800;
     }
-    nav button.active .nav-glyph{color:white;background:rgba(139,92,246,.52)}
+    nav button.active .nav-glyph{color:#06100d;background:var(--accent)}
     .nav-count{position:absolute;transform:translate(28px,-22px);min-width:18px;text-align:center;font-size:12px;font-weight:800;color:var(--muted)}
     .content{
       min-width:0;
@@ -865,15 +1752,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin:-76px calc(clamp(20px,2vw,38px) * -1) 24px;
       padding:14px clamp(20px,2vw,38px);
       border-bottom:0;
-      background:rgba(0,0,0,.44);
+      border-bottom:1px solid var(--hairline);
+      background:rgba(7,16,13,.76);
       backdrop-filter:blur(18px) saturate(1.2);
       -webkit-backdrop-filter:blur(18px) saturate(1.2);
     }
     .topbar-title{font-size:28px;font-weight:850}
-    .topbar-title::after{content:" KernelSU";margin-left:8px;color:var(--accent);font-size:18px;font-weight:800}
+    .topbar-title::after{content:" / KernelSU";margin-left:8px;color:var(--accent);font-size:18px;font-weight:800}
     .top-actions{display:flex;gap:8px;align-items:center}
-    .icon-button{display:grid;place-items:center;width:44px;height:44px;padding:0;border-radius:16px;font-weight:800}
-    .primary{border-color:color-mix(in srgb,var(--accent),white 30%);background:linear-gradient(180deg,color-mix(in srgb,var(--accent),white 12%),var(--accent));color:white}
+    .icon-button{display:grid;place-items:center;width:44px;height:44px;padding:0;border-radius:12px;font-weight:800}
+    .primary{border-color:color-mix(in srgb,var(--accent),white 30%);background:linear-gradient(180deg,color-mix(in srgb,var(--accent),white 10%),var(--accent));color:#03100b}
     .ok{border-color:color-mix(in srgb,var(--accent-2),white 30%);background:linear-gradient(180deg,color-mix(in srgb,var(--accent-2),white 12%),var(--accent-2));color:white}
     .danger{border-color:color-mix(in srgb,var(--danger),white 26%);background:linear-gradient(180deg,color-mix(in srgb,var(--danger),white 10%),var(--danger));color:white}
     section{display:none;animation:lift .22s ease both}
@@ -882,7 +1770,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     @media(prefers-reduced-motion:reduce){*,section{animation:none!important;transition:none!important}}
     .hero{
       display:grid;
-      grid-template-columns:minmax(0,1fr) minmax(420px,.55fr);
+      grid-template-columns:minmax(0,1fr) minmax(360px,.44fr);
       gap:18px;
       align-items:stretch;
       max-width:1840px;
@@ -898,6 +1786,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       overflow:hidden;
     }
     .panel,.item{position:relative}
+    .panel,.item,.slider-card,.wide-meter{min-width:0}
     .panel::before,.item::before,.empty::before,.notice::before{
       content:"";
       position:absolute;
@@ -906,8 +1795,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background:rgba(255,255,255,.18);
     }
     .panel{padding:28px}
+    .panel.hero-card{
+      background:
+        linear-gradient(135deg,rgba(0,199,129,.24),transparent 38%),
+        linear-gradient(225deg,rgba(47,124,255,.18),transparent 44%),
+        var(--glass-strong);
+    }
     .headline{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}
-    h2{margin:0;font-size:26px;line-height:1.1;font-weight:850;letter-spacing:0}
+    h2{margin:0;font-size:26px;line-height:1.1;font-weight:850;letter-spacing:0;overflow-wrap:anywhere}
     h3{margin:0;font-size:19px;font-weight:820;letter-spacing:0}
     .muted{color:var(--muted)}
     .small{font-size:12px}
@@ -928,7 +1823,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       min-height:118px;
       padding:18px 20px;
       border:1px solid var(--hairline);
-      border-radius:22px;
+      border-radius:16px;
       background:var(--fill);
     }
     .metric span{display:block;color:var(--muted);font-size:12px;font-weight:650}
@@ -983,16 +1878,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       width:54px;
       height:54px;
       border-radius:50%;
-      background:
-        radial-gradient(circle at 50% 18%,rgba(255,255,255,.88),rgba(255,255,255,.22) 34%,transparent 38%),
-        linear-gradient(180deg,#f5f5f5,#9fa5ad);
+      background:linear-gradient(180deg,#f9fffc,#aab7b1);
       box-shadow:0 8px 18px rgba(0,0,0,.38),inset 0 1px 0 rgba(255,255,255,.7);
       transition:left .2s ease,transform .2s ease;
     }
     .switch.on{
-      background:
-        linear-gradient(180deg,rgba(118,255,151,.78),rgba(14,188,76,.92) 50%,rgba(10,132,50,.94));
-      box-shadow:inset 0 4px 9px rgba(255,255,255,.24),inset 0 -10px 18px rgba(0,0,0,.22),0 0 18px rgba(52,199,89,.20);
+      background:linear-gradient(180deg,rgba(80,255,170,.78),rgba(0,199,129,.92) 50%,rgba(0,122,79,.94));
+      box-shadow:inset 0 4px 9px rgba(255,255,255,.24),inset 0 -10px 18px rgba(0,0,0,.22),0 0 18px rgba(0,199,129,.20);
     }
     .switch.on::after{left:58px}
     .empty,.notice{
@@ -1011,9 +1903,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       border-radius:999px;
       background:rgba(255,255,255,.055);
       overflow:auto;
+      min-width:0;
+      width:100%;
     }
     .seg{
       min-height:48px;
+      min-width:0;
       padding:0 24px;
       border-radius:16px;
       color:var(--ink);
@@ -1022,7 +1917,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-weight:800;
       white-space:nowrap;
     }
-    .seg.active{color:var(--accent);background:rgba(0,122,255,.22)}
+    .seg.active{color:var(--accent);background:rgba(0,199,129,.16)}
     .bar{
       height:12px;
       border-radius:999px;
@@ -1035,8 +1930,36 @@ const INDEX_HTML: &str = r#"<!doctype html>
       height:100%;
       width:var(--value,50%);
       border-radius:999px;
-      background:linear-gradient(90deg,rgba(0,122,255,.58),var(--accent));
+      background:linear-gradient(90deg,var(--accent),var(--accent-2));
     }
+    .runtime-stack{display:grid;gap:12px;margin-top:18px}
+    .runtime-row{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      padding:12px 14px;
+      border:1px solid var(--hairline);
+      border-radius:14px;
+      background:var(--fill);
+    }
+    .runtime-row span{color:var(--muted);font-size:12px;font-weight:750;text-transform:uppercase}
+    .runtime-row b{min-width:0;font-size:13px;overflow-wrap:anywhere;text-align:right}
+    .status-ribbon{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:12px;
+      margin-top:22px;
+    }
+    .ribbon-cell{
+      min-height:84px;
+      padding:14px;
+      border:1px solid var(--hairline);
+      border-radius:16px;
+      background:rgba(255,255,255,.08);
+    }
+    .ribbon-cell span{display:block;color:var(--muted);font-size:12px;font-weight:750}
+    .ribbon-cell b{display:block;margin-top:8px;font-size:22px}
     .control-stack{
       display:grid;
       gap:18px;
@@ -1082,11 +2005,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .range::-webkit-slider-thumb{
       appearance:none;
-      width:92px;
-      height:54px;
-      margin-top:-21px;
+      width:34px;
+      height:34px;
+      margin-top:-11px;
       border:0;
-      border-radius:22px;
+      border-radius:50%;
       background:linear-gradient(180deg,#fff,#f2f2f2);
       box-shadow:0 10px 22px rgba(0,0,0,.38),inset 0 1px 0 rgba(255,255,255,.9);
     }
@@ -1102,19 +2025,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
       -webkit-backdrop-filter:blur(18px) saturate(1.2);
     }
     .meter-title{text-align:center;font-size:20px;font-weight:850;margin:8px 0 30px;color:var(--muted)}
-    .core-row{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:12px}
-    .core{display:grid;gap:10px;text-align:center;color:var(--muted);font-weight:800}
-    .core .bar{height:10px;margin:0}
+    .health-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+    .health-tile{padding:16px;border:1px solid var(--hairline);border-radius:16px;background:var(--fill)}
+    .health-tile b{display:block;font-size:18px}
+    .health-tile span{display:block;margin-top:6px;color:var(--muted);font-size:12px;font-weight:750}
     .bottom-tabs{
       position:fixed;
       z-index:5;
-      left:50%;
-      right:auto;
+      left:14px;
+      right:14px;
       bottom:calc(18px + env(safe-area-inset-bottom));
       display:grid;
       grid-template-columns:repeat(4,1fr);
-      width:min(620px,calc(100vw - 28px));
-      transform:translateX(-50%);
+      width:auto;
+      max-width:620px;
+      margin:0 auto;
       gap:4px;
       padding:8px;
       border:1px solid var(--hairline);
@@ -1145,14 +2070,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .bottom-tabs button[data-tab="features"]::before{content:"▰"}
     .bottom-tabs button[data-tab="modules"]::before{content:"⚙"}
     .bottom-tabs button.active{color:var(--accent);background:rgba(255,255,255,.12)}
+    .bottom-tabs button[data-tab="status"]::before{content:"S"}
+    .bottom-tabs button[data-tab="su"]::before{content:"R"}
+    .bottom-tabs button[data-tab="features"]::before{content:"F"}
+    .bottom-tabs button[data-tab="modules"]::before{content:"M"}
+    @media(min-width:861px){
+      .bottom-tabs{display:none}
+      .content{padding-bottom:48px}
+    }
     @media(max-width:860px){
       .app{display:block}
       .sidebar{display:none}
       .content{padding:72px 14px 104px}
       .topbar{margin:-72px -14px 16px;padding:12px 20px}
+      .topbar-title{font-size:28px}
       .hero{grid-template-columns:1fr}
       .stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
       .grid{grid-template-columns:1fr}
+      .status-ribbon,.health-grid{grid-template-columns:1fr}
       .bottom-tabs{bottom:calc(10px + env(safe-area-inset-bottom));padding:6px}
       .bottom-tabs button{min-height:54px;font-size:11px}
       .bottom-tabs button.active{color:white;background:rgba(0,122,255,.95)}
@@ -1164,7 +2099,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       .token-grid{grid-template-columns:1fr}
       .stat-grid{grid-template-columns:1fr}
       .headline,.item-head{align-items:flex-start;flex-direction:column}
-      .switch{align-self:flex-end}
+      .switch{align-self:flex-start;width:92px;height:42px}
+      .switch::after{width:46px;height:46px}
+      .switch.on::after{left:48px}
+      .segment{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:8px;border-radius:18px}
+      .seg{padding:0 8px}
+      .runtime-row{display:grid;grid-template-columns:1fr}
+      .runtime-row b{text-align:left}
+      .topbar-title::after{display:none}
+      .bottom-tabs button{font-size:10px}
+      h2{font-size:24px}
     }
   </style>
 </head>
@@ -1188,16 +2132,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="topbar-title" id="screenTitle">Status</div>
         <div class="top-actions">
           <span id="compactAuthState" class="pill bad">No token</span>
-          <button id="refreshButton" class="icon-button" type="button" title="Refresh" aria-label="Refresh">R</button>
+          <button id="refreshButton" class="icon-button" type="button" title="Refresh" aria-label="Refresh">Re</button>
         </div>
       </div>
       <section id="status" class="active">
         <div class="hero">
-          <div class="panel">
+          <div class="panel hero-card">
             <div class="headline">
               <div>
-                <p class="eyebrow">System</p>
-                <h2>Root control surface</h2>
+                <p class="eyebrow">System guard</p>
+                <h2>Root control, live and local</h2>
               </div>
               <button id="promptSwitch" class="switch" type="button" aria-label="Toggle web SU prompt"></button>
             </div>
@@ -1216,8 +2160,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
             </div>
           </div>
           <div class="panel">
-            <h3>Runtime</h3>
+            <h3>Runtime snapshot</h3>
             <div id="statusSummary" class="desc">Waiting for status.</div>
+            <div id="runtimeDetails" class="runtime-stack"></div>
           </div>
         </div>
         <div id="statusOut"></div>
@@ -1331,11 +2276,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
         $('safeModePill').className = s.safe_mode ? 'pill bad' : 'pill good';
         $('safeModePill').textContent = s.safe_mode ? 'Safe mode' : 'Normal';
         $('statusSummary').innerHTML = `${esc(s.ksud_version_name)} / UAPI ${esc(s.kernel_uapi_version)}`;
+        $('runtimeDetails').innerHTML = `<div class="runtime-row"><span>Kernel</span><b>${esc(s.kernel_version)}</b></div>
+          <div class="runtime-row"><span>ksud code</span><b>${esc(s.ksud_version_code)}</b></div>
+          <div class="runtime-row"><span>Flags</span><b>${esc('0x' + Number(s.kernel_flags || 0).toString(16))}</b></div>`;
+        await syncFeatureState();
         $('statusOut').innerHTML = `<div class="stat-grid">
-          <div class="metric"><span>Kernel</span><b>${esc(s.kernel_version)}</b><div class="bar" style="--value:72%"><span></span></div></div>
-          <div class="metric"><span>Features</span><b>${esc('0x' + Number(s.kernel_features || 0).toString(16))}</b><div class="bar" style="--value:84%"><span></span></div></div>
-          <div class="metric"><span>Flags</span><b>${esc('0x' + Number(s.kernel_flags || 0).toString(16))}</b><div class="bar" style="--value:42%"><span></span></div></div>
-          <div class="metric"><span>ksud</span><b>${esc(s.ksud_version_code)}</b><div class="bar" style="--value:64%"><span></span></div></div>
+          <div class="metric"><span>Security state</span><b>${s.safe_mode ? 'Safe mode' : 'Normal'}</b><div class="bar" style="--value:${s.safe_mode ? 28 : 88}%"><span></span></div></div>
+          <div class="metric"><span>Feature mask</span><b>${esc('0x' + Number(s.kernel_features || 0).toString(16))}</b><div class="bar" style="--value:84%"><span></span></div></div>
+          <div class="metric"><span>Kernel flags</span><b>${esc('0x' + Number(s.kernel_flags || 0).toString(16))}</b><div class="bar" style="--value:48%"><span></span></div></div>
+          <div class="metric"><span>Version code</span><b>${esc(s.ksud_version_code)}</b><div class="bar" style="--value:64%"><span></span></div></div>
         </div>
         <div class="control-stack">
           <div class="slider-card">
@@ -1350,14 +2299,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <div class="range-labels"><span>300 ms</span><span>Balanced</span><span>5.0 s</span></div>
           </div>
           <div class="wide-meter">
-            <div class="meter-title">KernelSU</div>
-            <div class="core-row">
-              ${[62,54,48,71,82,67,39,44].map((v,i)=>`<div class="core"><div class="bar" style="--value:${v}%"><span></span></div><b>${i < 4 ? '970' : '768'}MHz</b><small>Core ${i}</small></div>`).join('')}
+            <div class="meter-title">Control health</div>
+            <div class="health-grid">
+              <div class="health-tile"><b>${s.safe_mode ? 'Restricted' : 'Ready'}</b><span>Boot policy</span></div>
+              <div class="health-tile"><b>${webPromptEnabled ? 'Prompting' : 'Quiet'}</b><span>SU prompt</span></div>
+              <div class="health-tile"><b>Local</b><span>127.0.0.1:9700</span></div>
             </div>
           </div>
         </div>`;
         bindPollSlider();
-        await syncFeatureState();
       } catch(e) {
         $('safeModePill').className = 'pill bad';
         $('safeModePill').textContent = 'Offline';
@@ -1365,6 +2315,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         webPromptSupported = false;
         renderWebPromptState();
         $('statusSummary').textContent = e.message;
+        $('runtimeDetails').innerHTML = '';
         notice('statusOut', e.message, true);
       }
     }
