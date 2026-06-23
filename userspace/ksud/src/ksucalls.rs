@@ -250,9 +250,8 @@ fn write_c_string(dst: &mut [c_char], value: &str) -> Result<()> {
 fn read_c_string(src: &[c_char]) -> String {
     let bytes = src
         .iter()
-        .copied()
-        .take_while(|v| *v != 0)
-        .map(|v| v as u8)
+        .take_while(|v| **v != 0)
+        .map(|v| (*v).to_ne_bytes()[0])
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&bytes).to_string()
 }
