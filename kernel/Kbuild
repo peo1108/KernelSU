@@ -73,7 +73,7 @@ else
 KSU_KERNEL_DIR := $(src)
 endif
 
-ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include
+ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include -I$(KSU_KERNEL_DIR)/..
 
 obj-$(CONFIG_KSU) += kernelsu.o
 
