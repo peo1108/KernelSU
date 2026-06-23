@@ -227,6 +227,20 @@ jobs:
             echo "UPLOAD=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Setup signing availability
+        id: signing
+        env:
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          elif [ -n "$PROD_KEYSTORE" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "Production signing secrets are not configured; skipping repack/resign."
+          fi
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
@@ -265,7 +279,7 @@ jobs:
           cp -f "$X86_64_KSUD" target/x86_64-linux-android/release/ksud
 
       - name: Prepare signing inputs
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: steps.signing.outputs.available == 'true'
         env:
           PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
           PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
@@ -291,7 +305,7 @@ jobs:
           fi
 
       - name: Repack and resign
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: steps.signing.outputs.available == 'true'
         run: |
           python3 repack_apk.py repack \
             -b release \
@@ -305,14 +319,14 @@ jobs:
             --strip
 
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: steps.signing.outputs.available == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: manager
           path: dist/*.apk
 
       - name: Bot session cache
-        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true'
+        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true' && steps.signing.outputs.available == 'true'
         id: bot_session_cache
         uses: actions/cache@v5
         with:
@@ -320,7 +334,7 @@ jobs:
           key: ${{ runner.os }}-bot-session
 
       - name: Upload to telegram
-        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true'
+        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true' && steps.signing.outputs.available == 'true'
         env:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
