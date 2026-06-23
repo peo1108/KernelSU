@@ -153,14 +153,17 @@ pub fn stop() -> Result<()> {
         .context("invalid webadmin pid")?;
     let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
     if ret != 0 {
-        bail!("failed to stop webadmin: {}", std::io::Error::last_os_error());
+        bail!(
+            "failed to stop webadmin: {}",
+            std::io::Error::last_os_error()
+        );
     }
     let _ = fs::remove_file(PID_PATH);
     println!("webadmin stopped");
     Ok(())
 }
 
-pub fn status() -> Result<()> {
+pub fn status() {
     let token_exists = Path::new(TOKEN_PATH).exists();
     let autostart = Path::new(AUTOSTART_PATH).exists();
     let listening = is_running();
@@ -168,7 +171,6 @@ pub fn status() -> Result<()> {
     println!("running: {listening}");
     println!("token: {token_exists}");
     println!("autostart: {autostart}");
-    Ok(())
 }
 
 fn is_running() -> bool {
@@ -241,7 +243,12 @@ fn parse_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     })
 }
 
-fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) -> Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
@@ -251,15 +258,15 @@ fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body
     Ok(())
 }
 
-fn write_json(stream: &mut TcpStream, status: &str, value: Value) -> Result<()> {
-    let body = serde_json::to_vec(&value)?;
+fn write_json(stream: &mut TcpStream, status: &str, value: &Value) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
     write_response(stream, status, "application/json", &body)
 }
 
 fn origin_allowed(req: &HttpRequest) -> bool {
-    req.headers.get("origin").is_none_or(|origin| {
-        origin == "http://127.0.0.1:9700" || origin == "http://localhost:9700"
-    })
+    req.headers
+        .get("origin")
+        .is_none_or(|origin| origin == "http://127.0.0.1:9700" || origin == "http://localhost:9700")
 }
 
 fn is_authorized(req: &HttpRequest, token: &str) -> bool {
@@ -280,7 +287,7 @@ fn parse_json_body(req: &HttpRequest) -> Result<Value> {
     Ok(serde_json::from_slice(&req.body)?)
 }
 
-fn feature_names() -> [(&'static str, u32, &'static str); 6] {
+const fn feature_names() -> [(&'static str, u32, &'static str); 6] {
     [
         ("su_compat", 0, "SU compatibility mode"),
         ("kernel_umount", 1, "Kernel umount"),
@@ -368,15 +375,21 @@ fn string_from_nul(bytes: &[u8]) -> String {
 }
 
 fn read_u16_le(bytes: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(bytes.get(off..off + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        bytes.get(off..off + 2)?.try_into().ok()?,
+    ))
 }
 
 fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        bytes.get(off..off + 4)?.try_into().ok()?,
+    ))
 }
 
 fn read_u64_le(bytes: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(off..off + 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        bytes.get(off..off + 8)?.try_into().ok()?,
+    ))
 }
 
 fn parse_event_header(bytes: &[u8]) -> Option<EventHeader> {
@@ -391,9 +404,9 @@ fn parse_su_request(payload: &[u8], packages: &HashMap<u32, Vec<String>>) -> Opt
     let deadline_ms = read_u64_le(payload, 16)?;
     let uid = read_u32_le(payload, 24)?;
     let euid = read_u32_le(payload, 28)?;
-    let pid = read_u32_le(payload, 32)?;
+    let process_id = read_u32_le(payload, 32)?;
     let tgid = read_u32_le(payload, 36)?;
-    let ppid = read_u32_le(payload, 40)?;
+    let parent_pid = read_u32_le(payload, 40)?;
     let comm = string_from_nul(payload.get(44..60)?);
     let path = string_from_nul(payload.get(60..188)?);
     let argv = string_from_nul(payload.get(188..444)?);
@@ -404,9 +417,9 @@ fn parse_su_request(payload: &[u8], packages: &HashMap<u32, Vec<String>>) -> Opt
         deadline_ms,
         uid,
         euid,
-        pid,
+        pid: process_id,
         tgid,
-        ppid,
+        ppid: parent_pid,
         comm,
         path,
         argv,
@@ -430,7 +443,7 @@ fn request_to_json(request: &SuRequest) -> Value {
     })
 }
 
-fn su_request_reader(state: Arc<Mutex<WebState>>) {
+fn su_request_reader(state: &Arc<Mutex<WebState>>) {
     let fd = match ksucalls::get_su_request_fd() {
         Ok(fd) => fd,
         Err(err) => {
@@ -439,11 +452,11 @@ fn su_request_reader(state: Arc<Mutex<WebState>>) {
         }
     };
     let _owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut packages = package_index();
     let mut buf = [0u8; READ_BUF_SIZE];
 
     loop {
-        let read_len = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        let read_len =
+            unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if read_len < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -469,7 +482,7 @@ fn su_request_reader(state: Arc<Mutex<WebState>>) {
             }
             let payload = &buf[offset + EVENT_HEADER_SIZE..offset + frame_len];
             if header.record_type != DROPPED_RECORD_TYPE {
-                packages = package_index();
+                let packages = package_index();
                 if let Some(request) = parse_su_request(payload, &packages) {
                     state
                         .lock()
@@ -494,7 +507,11 @@ fn handle_su_requests(state: &Arc<Mutex<WebState>>) -> Value {
     json!({ "requests": requests })
 }
 
-fn handle_su_decision(req: &HttpRequest, state: &Arc<Mutex<WebState>>, request_id: u64) -> Result<Value> {
+fn handle_su_decision(
+    req: &HttpRequest,
+    state: &Arc<Mutex<WebState>>,
+    request_id: u64,
+) -> Result<Value> {
     let body = parse_json_body(req)?;
     let decision = body
         .get("decision")
@@ -505,7 +522,10 @@ fn handle_su_decision(req: &HttpRequest, state: &Arc<Mutex<WebState>>, request_i
         "deny" => false,
         _ => bail!("decision must be allow or deny"),
     };
-    let remember = body.get("remember").and_then(Value::as_bool).unwrap_or(false);
+    let remember = body
+        .get("remember")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let request = state
         .lock()
         .expect("web state poisoned")
@@ -583,25 +603,53 @@ fn route_api(req: &HttpRequest, state: &Arc<Mutex<WebState>>) -> Result<Value> {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, token: &str, state: &Arc<Mutex<WebState>>) -> Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    token: &str,
+    state: &Arc<Mutex<WebState>>,
+) -> Result<()> {
     let req = parse_http_request(&mut stream)?;
     let path = req.path.split('?').next().unwrap_or(&req.path);
 
     if path.starts_with("/api/") {
         if !is_authorized(&req, token) {
-            return write_json(&mut stream, "401 Unauthorized", json!({ "error": "unauthorized" }));
+            return write_json(
+                &mut stream,
+                "401 Unauthorized",
+                &json!({ "error": "unauthorized" }),
+            );
         }
-        if matches!(req.method.as_str(), "POST" | "PATCH" | "PUT" | "DELETE") && !origin_allowed(&req) {
-            return write_json(&mut stream, "403 Forbidden", json!({ "error": "bad origin" }));
+        if matches!(req.method.as_str(), "POST" | "PATCH" | "PUT" | "DELETE")
+            && !origin_allowed(&req)
+        {
+            return write_json(
+                &mut stream,
+                "403 Forbidden",
+                &json!({ "error": "bad origin" }),
+            );
         }
         match route_api(&req, state) {
-            Ok(value) => write_json(&mut stream, "200 OK", value),
-            Err(err) => write_json(&mut stream, "400 Bad Request", json!({ "error": err.to_string() })),
+            Ok(value) => write_json(&mut stream, "200 OK", &value),
+            Err(err) => write_json(
+                &mut stream,
+                "400 Bad Request",
+                &json!({ "error": err.to_string() }),
+            ),
         }
     } else if req.method == "GET" && (path == "/" || path == "/index.html") {
-        write_response(&mut stream, "200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes())
+        write_response(
+            &mut stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            INDEX_HTML.as_bytes(),
+        )
     } else {
-        write_response(&mut stream, "404 Not Found", "text/plain; charset=utf-8", b"not found\n")
+        write_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+        )
     }
 }
 
@@ -610,7 +658,7 @@ pub fn serve() -> Result<()> {
     fs::write(PID_PATH, format!("{}\n", std::process::id()))?;
     let state = Arc::new(Mutex::new(WebState::default()));
     let reader_state = Arc::clone(&state);
-    std::thread::spawn(move || su_request_reader(reader_state));
+    std::thread::spawn(move || su_request_reader(&reader_state));
 
     let listener = TcpListener::bind(LISTEN_ADDR).with_context(|| format!("bind {LISTEN_ADDR}"))?;
     log::info!("webadmin listening at http://{LISTEN_ADDR}");

@@ -827,7 +827,10 @@ pub fn run() -> Result<()> {
             Web::Start => webadmin::spawn(),
             Web::Serve => webadmin::serve(),
             Web::Stop => webadmin::stop(),
-            Web::Status => webadmin::status(),
+            Web::Status => {
+                webadmin::status();
+                Ok(())
+            }
             Web::Token => webadmin::print_token(),
             Web::Autostart { command } => match command {
                 WebAutostart::On => webadmin::set_autostart(true),
