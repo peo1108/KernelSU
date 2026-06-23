@@ -193,10 +193,8 @@ fn temp_upload_path() -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    Ok(Path::new(defs::WORKING_DIR).join(format!(
-        "webadmin-upload-{}-{now}.zip",
-        std::process::id()
-    )))
+    Ok(Path::new(defs::WORKING_DIR)
+        .join(format!("webadmin-upload-{}-{now}.zip", std::process::id())))
 }
 
 fn parse_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
@@ -353,12 +351,15 @@ fn validate_package_name(package: &str) -> Result<()> {
         package.len() < ksu_uapi_max_package_name(),
         "package name too long"
     );
-    ensure!(!package.as_bytes().contains(&0), "package contains nul byte");
+    ensure!(
+        !package.as_bytes().contains(&0),
+        "package contains nul byte"
+    );
     ensure!(
         package == ksucalls::NON_ROOT_DEFAULT_PROFILE_KEY
-            || package.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':')
-            }),
+            || package
+                .chars()
+                .all(|c| { c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':') }),
         "invalid package name"
     );
     Ok(())
@@ -393,7 +394,8 @@ fn percent_decode(value: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0usize;
     while idx < bytes.len() {
-        if bytes[idx] == b'%' && idx + 2 < bytes.len()
+        if bytes[idx] == b'%'
+            && idx + 2 < bytes.len()
             && let (Some(high), Some(low)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
         {
             out.push((high << 4) | low);
@@ -443,24 +445,36 @@ fn int_vec_from_json(body: &Value, key: &str) -> Result<Vec<i32>> {
     values
         .iter()
         .map(|v| {
-            let value = v.as_i64().with_context(|| format!("{key} must contain integers"))?;
+            let value = v
+                .as_i64()
+                .with_context(|| format!("{key} must contain integers"))?;
             i32::try_from(value).with_context(|| format!("{key} value overflows i32"))
         })
         .collect()
 }
 
-fn profile_from_json(body: &Value, uid: u32, fallback_package: &str) -> Result<ksucalls::AppProfile> {
+fn profile_from_json(
+    body: &Value,
+    uid: u32,
+    fallback_package: &str,
+) -> Result<ksucalls::AppProfile> {
     let name = body
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or(fallback_package);
     validate_package_name(name)?;
-    ensure!(name == fallback_package, "profile package does not match route");
+    ensure!(
+        name == fallback_package,
+        "profile package does not match route"
+    );
     let current_uid = body
         .get("currentUid")
         .and_then(Value::as_i64)
         .unwrap_or(i64::from(uid));
-    ensure!(current_uid == i64::from(uid), "profile uid does not match route");
+    ensure!(
+        current_uid == i64::from(uid),
+        "profile uid does not match route"
+    );
 
     let mut profile = ksucalls::AppProfile::default_for(name, uid);
     profile.allow_su = bool_from_body(body, "allowSu").unwrap_or(false);
@@ -759,7 +773,8 @@ fn handle_settings_patch(req: &HttpRequest) -> Result<Value> {
     let body = parse_json_body(req)?;
     if let Some(features) = body.get("features").and_then(Value::as_object) {
         for (name, value) in features {
-            let id = feature_id_by_name(name).with_context(|| format!("unknown feature: {name}"))?;
+            let id =
+                feature_id_by_name(name).with_context(|| format!("unknown feature: {name}"))?;
             let enabled = value
                 .as_bool()
                 .or_else(|| value.as_u64().map(|v| v != 0))
@@ -1003,7 +1018,11 @@ fn handle_module_install(req: &HttpRequest) -> Result<Value> {
 }
 
 fn content_type_for(path: &Path) -> &'static str {
-    match path.extension().and_then(|v| v.to_str()).unwrap_or_default() {
+    match path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default()
+    {
         "html" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" => "application/javascript; charset=utf-8",

@@ -322,8 +322,8 @@ fn app_profile_from_raw(raw: &ksu_uapi::app_profile) -> AppProfile {
     if raw.allow_su {
         unsafe {
             let rp_config = &raw.__bindgen_anon_1.rp_config;
-            let group_count = (rp_config.profile.groups_count as usize)
-                .min(ksu_uapi::KSU_MAX_GROUPS as usize);
+            let group_count =
+                (rp_config.profile.groups_count as usize).min(ksu_uapi::KSU_MAX_GROUPS as usize);
             profile.root_use_default = rp_config.use_default;
             profile.root_template = {
                 let template = read_c_string(&rp_config.template_name);
