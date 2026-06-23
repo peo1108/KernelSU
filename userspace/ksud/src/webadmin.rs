@@ -240,8 +240,7 @@ fn parse_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .unwrap_or(0);
 
     let mut body = Vec::new();
-    let mut upload_path = None;
-    if is_module_install_request(&method, &path) {
+    let upload_path = if is_module_install_request(&method, &path) {
         if content_len > MODULE_UPLOAD_LIMIT {
             bail!("module zip too large");
         }
@@ -268,7 +267,7 @@ fn parse_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             written += take;
         }
         file.sync_all()?;
-        upload_path = Some(path);
+        Some(path)
     } else {
         if content_len > JSON_BODY_LIMIT {
             bail!("request body too large");
@@ -282,7 +281,8 @@ fn parse_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             body.extend_from_slice(&tmp[..n]);
         }
         body.truncate(content_len);
-    }
+        None
+    };
 
     Ok(HttpRequest {
         method,
@@ -337,8 +337,8 @@ fn parse_json_body(req: &HttpRequest) -> Result<Value> {
     Ok(serde_json::from_slice(&req.body)?)
 }
 
-fn api_error(message: impl ToString, code: &str) -> Value {
-    json!({ "error": message.to_string(), "code": code })
+fn api_error(message: &str, code: &str) -> Value {
+    json!({ "error": message, "code": code })
 }
 
 fn bool_from_body(body: &Value, key: &str) -> Option<bool> {
@@ -381,7 +381,7 @@ fn query_param(path: &str, name: &str) -> Option<String> {
 }
 
 fn percent_decode(value: &str) -> String {
-    fn hex_value(byte: u8) -> Option<u8> {
+    const fn hex_value(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -470,7 +470,7 @@ fn profile_from_json(
     let current_uid = body
         .get("currentUid")
         .and_then(Value::as_i64)
-        .unwrap_or(i64::from(uid));
+        .unwrap_or_else(|| i64::from(uid));
     ensure!(
         current_uid == i64::from(uid),
         "profile uid does not match route"
@@ -572,7 +572,7 @@ fn handle_status() -> Value {
 fn handle_features() -> Value {
     let features = feature_names()
         .iter()
-        .map(|(name, id, description)| feature_state(*name, *id, *description))
+        .map(|(name, id, description)| feature_state(name, *id, description))
         .collect::<Vec<_>>();
     json!({ "features": features })
 }
@@ -618,13 +618,12 @@ fn seccomp_status() -> String {
     status
         .lines()
         .find_map(|line| line.strip_prefix("Seccomp:").map(str::trim))
-        .map(|value| match value {
+        .map_or("unknown", |value| match value {
             "0" => "disabled",
             "1" => "strict",
             "2" => "filter",
             _ => "unknown",
         })
-        .unwrap_or("unknown")
         .to_string()
 }
 
@@ -734,10 +733,7 @@ fn handle_app_profile_put(req: &HttpRequest, uid: u32) -> Result<Value> {
     validate_package_name(&package)?;
     let body = parse_json_body(req)?;
     let profile = profile_from_json(&body, uid, &package)?;
-    if profile.allow_su && !profile.root_use_default && !profile.rules.trim().is_empty() {
-        profile::set_sepolicy(profile.name.clone(), profile.rules.clone())
-            .context("set profile sepolicy")?;
-    } else if !profile.rules.trim().is_empty() {
+    if !profile.rules.trim().is_empty() {
         profile::set_sepolicy(profile.name.clone(), profile.rules.clone())
             .context("set profile sepolicy")?;
     }
@@ -748,7 +744,7 @@ fn handle_app_profile_put(req: &HttpRequest, uid: u32) -> Result<Value> {
 fn settings_value() -> Value {
     let features = feature_names()
         .iter()
-        .map(|(name, id, description)| feature_state(*name, *id, *description))
+        .map(|(name, id, description)| feature_state(name, *id, description))
         .collect::<Vec<_>>();
     json!({
         "features": features,
@@ -1137,7 +1133,7 @@ fn handle_connection(
                 Err(err) => write_json(
                     &mut stream,
                     "400 Bad Request",
-                    &api_error(err, "bad_request"),
+                    &api_error(&err.to_string(), "bad_request"),
                 ),
             }
         }

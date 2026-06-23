@@ -17,6 +17,7 @@ pub const KERNEL_SU_DOMAIN: &str = "u:r:ksu:s0";
 pub const FLAG_KSU_NO_NEW_PRIVS: u64 = 1;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppProfile {
     pub name: String,
     pub current_uid: i32,
@@ -58,7 +59,7 @@ impl AppProfile {
     }
 
     #[must_use]
-    pub fn has_custom_profile(&self) -> bool {
+    pub const fn has_custom_profile(&self) -> bool {
         if self.allow_su {
             !self.root_use_default
         } else {
@@ -249,7 +250,7 @@ fn write_c_string(dst: &mut [c_char], value: &str) -> Result<()> {
 fn read_c_string(src: &[c_char]) -> String {
     let bytes = src
         .iter()
-        .map(|v| *v as u8)
+        .map(|v| *v)
         .take_while(|v| *v != 0)
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&bytes).to_string()
@@ -258,7 +259,6 @@ fn read_c_string(src: &[c_char]) -> String {
 fn caps_to_list(bits: u64) -> Vec<i32> {
     (0..64)
         .filter(|cap| bits & (1u64 << cap) != 0)
-        .map(|cap| cap as i32)
         .collect()
 }
 
