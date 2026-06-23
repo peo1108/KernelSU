@@ -4,6 +4,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
+const MIN_VERSION_CODE: u32 = 32522;
+
 fn get_git_version() -> Result<(u32, String), std::io::Error> {
     let output = Command::new("git")
         .args(["rev-list", "--count", "HEAD"])
@@ -15,7 +17,7 @@ fn get_git_version() -> Result<(u32, String), std::io::Error> {
         .trim()
         .parse()
         .map_err(|_| std::io::Error::other("Failed to parse git count"))?;
-    let version_code = 30000 + version_code;
+    let version_code = MIN_VERSION_CODE.max(30000 + version_code);
 
     let version_name = String::from_utf8(
         Command::new("git")
